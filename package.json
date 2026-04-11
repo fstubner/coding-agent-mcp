@@ -1,0 +1,22 @@
+{
+  "name": "coding-agent-mcp",
+  "version": "0.1.0",
+  "description": "MCP server that routes coding tasks across Claude Code, Cursor, Codex, and Gemini CLI with quota-aware load balancing",
+  "keywords": ["mcp", "claude", "coding", "ai-agents", "llm", "cursor", "codex", "gemini"],
+  "license": "MIT",
+  "author": "Felix Stubner",
+  "bin": {
+    "coding-agent-mcp": "./bin/coding-agent-mcp.js"
+  },
+  "files": [
+    "bin/",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/fstubner/coding-agent-mcp"
+  }
+}

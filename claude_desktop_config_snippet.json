@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "coding-agent": {
+      "command": "npx",
+      "args": ["coding-agent-mcp"],
+      "env": {
+        "CODING_AGENT_CONFIG": "/path/to/your/config.yaml",
+        "GEMINI_API_KEY": "your-gemini-api-key-here"
+      }
+    }
+  }
+}

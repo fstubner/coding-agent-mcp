@@ -1,0 +1,344 @@
+# coding-agent-mcp — service configuration
+#
+# ── Architecture: (model × harness) ─────────────────────────────────────────
+#
+# Each service is a (model, harness) pair:
+#
+#   harness   — which CLI agent scaffold runs the model. Determines dispatcher:
+#               "claude_code" | "cursor" | "codex" | "gemini_cli"
+#               The harness adds agent scaffolding value beyond the raw model API.
+#
+#   model     — the exact model string passed to the CLI (--model flag).
+#               Claude Code / Cursor: e.g. claude-opus-4-6-thinking-max
+#               Codex:  gpt-5.4, gpt-5.4-mini, gpt-5.3-codex
+#               Gemini: pro, flash, gemini-3.1-pro-preview
+#
+# The same model running in different harnesses gets different cli_capability
+# scores — e.g. claude-opus-4-6 in Claude Code vs Cursor perform differently.
+#
+# ── Quality scoring ──────────────────────────────────────────────────────────
+#
+#   final_score = normalized_elo × thinking_mult × cli_capability
+#                 × capabilities[task_type] × quota_score × weight
+#
+#   normalized_elo  — Arena Code ELO mapped to [0.60, 1.00] (auto-fetched daily)
+#   thinking_mult   — 1.00 (none/low) | 1.07 (medium) | 1.15 (high)
+#   cli_capability  — harness amplification factor [0.0 – 1.5]
+#   capabilities    — per-task relative strength: execute | plan | review
+#   quota_score     — live quota availability [0, 1], auto-tracked
+#   weight          — static preference multiplier (default 1.0)
+#
+# ── Tiers ───────────────────────────────────────────────────────────────────
+#
+#   ELO ≥ 1350 → tier 1  (Frontier)
+#   ELO ≥ 1200 → tier 2  (Strong)
+#   ELO < 1200 → tier 3  (Fast / Local)
+#
+# Explicit tier is the fallback when leaderboard_model is not set.
+#
+# ── Cursor model naming ──────────────────────────────────────────────────────
+#
+# Cursor CLI model strings follow the schema:
+#   {model-base}-{reasoning-level}[-fast][-thinking]
+# Reasoning levels: none < low < medium < high < xhigh < max
+#
+# Examples (from `agent --list-models`):
+#   claude-sonnet-4-6                     → no suffix (model default reasoning)
+#   claude-sonnet-4-6-thinking-high       → extended thinking, high level
+#   claude-opus-4-6-thinking-max          → extended thinking, maximum
+#   gpt-5.4-max                           → GPT-5.4 with max reasoning
+#   gemini-2.5-pro-medium                 → Gemini 2.5 Pro with medium thinking
+#
+# ── API keys ─────────────────────────────────────────────────────────────────
+#
+# Use ${ENV_VAR} to reference environment variables set in claude_desktop_config.json.
+# OAuth-authenticated CLIs (claude_code, codex) don't need an api_key field.
+
+services:
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # TIER 1 — FRONTIER
+  # ════════════════════════════════════════════════════════════════════════════
+
+  # ── Claude Opus 4.6 via Claude Code CLI ─────────────────────────────────────
+  #
+  # Best for: plan + review. Extended thinking on Opus via claude_code scaffold.
+  # Escalation: this entry IS the escalated form — Sonnet is claude_code_sonnet.
+
+  claude_code_opus:
+    enabled: true
+    harness: claude_code
+    command: claude
+    model: claude-opus-4-6           # extended thinking enabled via --effort high
+    tier: 1
+    # api_key: ${ANTHROPIC_API_KEY}  # Claude Max/Pro → OAuth via `claude auth login`
+    leaderboard_model: "claude-opus-4-6"   # Arena Code ELO ~1504 (April 2026)
+    cli_capability: 1.10             # Claude Code scaffold: strong file ops + bash
+    weight: 1.0
+    capabilities:
+      execute: 0.93   # Sonnet handles execute better (cheaper, nearly identical)
+      plan:    1.00   # extended thinking = best-in-class for architecture
+      review:  1.00   # deep analysis, multi-file reasoning, architectural critique
+
+  # ── Claude Sonnet 4.6 via Claude Code CLI ────────────────────────────────────
+  #
+  # Best for: execute. Fast, 5× cheaper than Opus, 79.6% SWE-bench Verified.
+  # 1M token context. Escalate to claude_code_opus for plan/review via code_auto.
+
+  claude_code_sonnet:
+    enabled: true
+    harness: claude_code
+    command: claude
+    model: claude-sonnet-4-6
+    tier: 1
+    # api_key: ${ANTHROPIC_API_KEY}
+    leaderboard_model: "claude-sonnet-4-6"  # Arena Code ELO ~1310 (April 2026)
+    cli_capability: 1.10
+    weight: 1.0
+    capabilities:
+      execute: 0.96   # near-identical to Opus on SWE-bench (1.2pt gap)
+      plan:    0.85   # no extended thinking; fine for everyday design tasks
+      review:  0.88   # solid but code_auto will prefer Opus for deep reviews
+
+  # ── GPT-5.4 via Codex CLI (full-auto) ────────────────────────────────────────
+  #
+  # Best for: execute. Codex --full-auto drives code execution + test runner
+  # in a CI-style loop. Highest execute scores in the benchmark.
+
+  gpt54_codex:
+    enabled: true
+    harness: codex
+    command: codex
+    model: gpt-5.4
+    tier: 1
+    # api_key: ${OPENAI_API_KEY}  # ChatGPT Pro → OAuth via `codex auth login`
+    leaderboard_model: "gpt-5.4"    # Arena Code ELO ~1480 (April 2026)
+    # Codex --full-auto: code execution, test-runner, multi-step self-correction.
+    # SWE-bench Pro agent score ~46% (best execution scaffold, April 2026).
+    cli_capability: 1.08
+    weight: 1.0
+    capabilities:
+      execute: 1.00   # home turf — full-auto mode + test runner
+      plan:    0.83   # execution-focused model; weaker at open-ended design
+      review:  0.82   # optimised for doing, not explaining
+
+  # ── Gemini 3.1 Pro via Gemini CLI (high thinking) ────────────────────────────
+  #
+  # Best for: plan + review. 1M token context holds entire codebases.
+  # thinking_level: high injected via ~/.gemini/settings.json (thread-safe).
+
+  gemini31pro:
+    enabled: true
+    harness: gemini_cli
+    command: gemini
+    model: pro                       # CLI alias for 3.1 Pro Preview
+    tier: 1
+    api_key: ${GEMINI_API_KEY}       # or OAuth via `gemini auth`
+    leaderboard_model: "gemini-3.1-pro-preview"  # Arena Code ELO ~1456 (April 2026)
+    thinking_level: high             # injects thinkingLevel: HIGH into settings.json
+    cli_capability: 1.00             # thin API wrapper; no agentic scaffold
+    weight: 1.0
+    capabilities:
+      execute: 0.87   # no code-execution loop; thin CLI wrapper
+      plan:    0.97   # high thinking + 1M context = full codebase in view
+      review:  0.95   # 1M context lets it hold every file + import simultaneously
+
+  # ── Claude Sonnet 4.6 via Cursor CLI ─────────────────────────────────────────
+  #
+  # Best for: execute. Cursor agent is editor-aware with codebase indexing.
+  # SWE-bench Pro: 50.21% — highest agent score of the four CLIs (April 2026).
+
+  cursor_sonnet:
+    enabled: true
+    harness: cursor
+    command: agent
+    model: claude-sonnet-4-6         # passed via --model flag
+    tier: 1
+    leaderboard_model: "claude-sonnet-4-6"
+    cli_capability: 1.05             # editor-aware context + codebase index
+    weight: 1.0
+    capabilities:
+      execute: 1.00   # top SWE-bench Pro agent + Sonnet speed
+      plan:    0.82   # no extended thinking in Cursor; use claude_code_opus instead
+      review:  0.90   # editor-aware context is great for file-level review
+
+  # ── Claude Opus 4.6 (max thinking) via Cursor CLI ────────────────────────────
+  #
+  # High-quality plan/review with editor codebase awareness + Opus thinking.
+  # Disabled by default — slower and uses more quota than cursor_sonnet.
+  # Enable if you want cursor-specific context during architecture reviews.
+
+  cursor_opus:
+    enabled: false
+    harness: cursor
+    command: agent
+    model: claude-opus-4-6-thinking-max
+    tier: 1
+    leaderboard_model: "claude-opus-4-6"
+    cli_capability: 1.05
+    weight: 0.95
+    capabilities:
+      execute: 0.94
+      plan:    0.97
+      review:  0.96
+
+  # ── GPT-5.4 (max reasoning) via Cursor CLI ────────────────────────────────────
+  #
+  # Alternative execute path using GPT-5.4 through the Cursor harness.
+  # Useful when codex quota is exhausted.
+
+  cursor_gpt54:
+    enabled: false
+    harness: cursor
+    command: agent
+    model: gpt-5.4-max               # Cursor model string from --list-models
+    tier: 1
+    leaderboard_model: "gpt-5.4"
+    cli_capability: 1.03             # Cursor adds some value but codex-harness is better for GPT-5.4
+    weight: 0.90
+    capabilities:
+      execute: 0.96
+      plan:    0.84
+      review:  0.83
+
+  # ── Gemini 2.5 Pro (medium thinking) via Cursor CLI ──────────────────────────
+  #
+  # Large-context planning with Cursor's codebase indexing + Gemini thinking.
+
+  cursor_gemini25pro:
+    enabled: false
+    harness: cursor
+    command: agent
+    model: gemini-2.5-pro-medium
+    tier: 2
+    leaderboard_model: "gemini-2.5-pro"
+    cli_capability: 1.03
+    weight: 0.88
+    capabilities:
+      execute: 0.88
+      plan:    0.93
+      review:  0.91
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # TIER 2 — STRONG
+  # ════════════════════════════════════════════════════════════════════════════
+
+  # gemini25pro_gemini:
+  #   enabled: false
+  #   harness: gemini_cli
+  #   command: gemini
+  #   model: gemini-2.5-pro
+  #   tier: 2
+  #   api_key: ${GEMINI_API_KEY}
+  #   thinking_level: medium
+  #   leaderboard_model: "gemini-2.5-pro"
+  #   cli_capability: 1.00
+  #   weight: 0.90
+
+  # gpt53_codex:
+  #   enabled: false
+  #   harness: codex
+  #   command: codex
+  #   model: gpt-5.3-codex
+  #   tier: 2
+  #   leaderboard_model: "gpt-5.3-codex"
+  #   cli_capability: 1.06
+  #   weight: 0.90
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # TIER 3 — FAST / LIGHT
+  # ════════════════════════════════════════════════════════════════════════════
+
+  # claude_haiku_cc:
+  #   enabled: false
+  #   harness: claude_code
+  #   command: claude
+  #   model: claude-haiku-4-5-20251001
+  #   tier: 3
+  #   leaderboard_model: "claude haiku 4.5"
+  #   cli_capability: 1.08
+  #   weight: 0.70
+
+  # gemini25flash:
+  #   enabled: false
+  #   harness: gemini_cli
+  #   command: gemini
+  #   model: flash
+  #   tier: 3
+  #   api_key: ${GEMINI_API_KEY}
+  #   thinking_level: low
+  #   leaderboard_model: "gemini-2.5-flash"
+  #   cli_capability: 1.00
+  #   weight: 0.70
+
+  # gpt54mini_codex:
+  #   enabled: false
+  #   harness: codex
+  #   command: codex
+  #   model: gpt-5.4-mini
+  #   tier: 3
+  #   leaderboard_model: "gpt-5.4-mini"
+  #   cli_capability: 1.05
+  #   weight: 0.70
+
+  # codex_spark:
+  #   enabled: false
+  #   harness: codex
+  #   command: codex
+  #   model: gpt-5.3-codex-spark      # 1000+ TPS, near-instant; ChatGPT Pro only
+  #   tier: 3
+  #   leaderboard_model: "gpt-5.3-codex"
+  #   cli_capability: 1.04
+  #   weight: 0.65
+
+  # cursor_haiku:
+  #   enabled: false
+  #   harness: cursor
+  #   command: agent
+  #   model: claude-haiku-4-5-20251001
+  #   tier: 3
+  #   leaderboard_model: "claude haiku 4.5"
+  #   cli_capability: 1.03
+  #   weight: 0.65
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # OpenAI-compatible local / third-party endpoints
+  # Each enabled entry auto-generates a code_with_<name> MCP tool.
+  # ════════════════════════════════════════════════════════════════════════════
+
+  # ollama:
+  #   enabled: false
+  #   type: openai_compatible
+  #   base_url: http://localhost:11434/v1
+  #   model: llama3.2
+  #   api_key: ""
+  #   weight: 0.6
+  #   tier: 3
+
+  # lmstudio:
+  #   enabled: false
+  #   type: openai_compatible
+  #   base_url: http://localhost:1234/v1
+  #   model: mistral-7b-instruct
+  #   api_key: lm-studio
+  #   weight: 0.6
+  #   tier: 3
+
+  # openrouter_gpt54:
+  #   enabled: false
+  #   type: openai_compatible
+  #   base_url: https://openrouter.ai/api/v1
+  #   model: openai/gpt-5.4
+  #   api_key: ${OPENROUTER_API_KEY}
+  #   weight: 0.9
+  #   tier: 1
+  #   thinking_level: high
+
+# How long (seconds) to cache proactive quota check results.
+quota_cache_ttl: 300
+
+# Timeout (seconds) for subprocess / HTTP calls.
+timeout_seconds: 120
+
+# File to persist local call counts across restarts.
+state_file: quota_state.json

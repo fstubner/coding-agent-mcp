@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "coding-agent-mcp"
+version = "0.1.0"
+description = "MCP server that routes coding tasks across Claude Code, Cursor, Codex, and Gemini CLI with quota-aware load balancing"
+requires-python = ">=3.13"
+license = { text = "MIT" }
+authors = [{ name = "Felix Stubner" }]
+keywords = ["mcp", "claude", "coding", "ai-agents", "llm", "cursor", "codex", "gemini"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.13",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+]
+dependencies = [
+    "mcp>=1.0.0",
+    "pyyaml>=6.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pyflakes>=3.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/fstubner/coding-agent-mcp"
+Repository = "https://github.com/fstubner/coding-agent-mcp"
+Issues = "https://github.com/fstubner/coding-agent-mcp/issues"
+
+[project.scripts]
+coding-agent-mcp = "coding_agent.__main__:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

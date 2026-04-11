@@ -1,0 +1,43 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+*.egg
+.eggs/
+pip-wheel-metadata/
+
+# State files
+quota_state.json
+test_state.json
+
+# Editor
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Type checker
+.mypy_cache/
+
+# Pytest temp dirs
+pytest-cache-files-*/
+
+# Node.js/npm
+node_modules/
+*.tgz
+
+# Pre-rename artefacts (safe to delete manually)
+src/coding_router/
+*.egg-info/
+
+# Backup files from refactor
+*.bak
+
+# Local Claude Code settings
+.claude/settings.local.json
