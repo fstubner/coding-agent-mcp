@@ -2,18 +2,18 @@
 
 An MCP server that routes coding tasks across multiple AI CLI agents — Claude Code, Cursor, Codex, and Gemini CLI — with quota-aware load balancing, circuit breaking, and intelligent task-type routing.
 
-## Architecture: model × harness
+## Architecture: model x harness
 
 Each configured service is a **(model, harness)** pair. The harness is the CLI agent scaffold (which adds agentic value beyond the raw model API); the model is the exact string passed via `--model`.
 
 ```
-claude_code_opus   = claude-opus-4-6   × claude_code harness
-cursor_sonnet      = claude-sonnet-4-6 × cursor harness
-gpt54_codex        = gpt-5.4           × codex harness
-gemini31pro        = pro               × gemini_cli harness
+claude_code_opus  = claude-opus-4-6            x claude_code harness
+cursor_sonnet     = claude-sonnet-4-6          x cursor harness
+codex_gpt54       = gpt-5.4                    x codex harness
+gemini31pro       = gemini-3.1-pro-preview     x gemini_cli harness
 ```
 
-The same model in different harnesses gets different scores — Cursor's codebase indexing and Claude Code's file/bash tools produce meaningfully different results on the same model.
+The same model in different harnesses gets different scores. Cursor's codebase indexing and Claude Code's file/bash tools produce meaningfully different results on the same underlying model, which is why `cli_capability` is a separate multiplier from ELO.
 
 ## MCP tools
 
@@ -35,9 +35,10 @@ The same model in different harnesses gets different scores — Cursor's codebas
 Pass `hints` to `code_auto` or `code_mixture` to influence routing:
 
 ```json
-{ "task_type": "execute" }   // execute | plan | review
-{ "harness": "cursor" }      // restrict to a specific harness
-{ "prefer_large_context": true }  // boost Gemini (1M token context)
+{ "task_type": "execute" }          // execute | plan | review | local
+{ "harness": "cursor" }             // restrict to a specific harness
+{ "prefer_large_context": true }    // boost Gemini (1M token context)
+{ "service": "claude_code_opus" }   // force a specific service
 ```
 
 ## Scoring
@@ -45,18 +46,32 @@ Pass `hints` to `code_auto` or `code_mixture` to influence routing:
 Each service is scored per task:
 
 ```
-score = normalized_elo × thinking_mult × cli_capability
-        × capabilities[task_type] × quota_score × weight
+score = quality_score × cli_capability × capabilities[task_type] × quota_score × weight
 ```
 
-- **normalized_elo** — Arena Code leaderboard ELO mapped to [0.60, 1.00], fetched daily
-- **thinking_mult** — 1.00 (none/low) | 1.07 (medium) | 1.15 (high)
-- **cli_capability** — harness amplification factor, set in `config.yaml`
-- **capabilities** — per-service relative strength for execute / plan / review
-- **quota_score** — live availability [0, 1], tracked automatically
-- **weight** — static preference multiplier
+Where `quality_score = normalized_elo × thinking_mult`, and:
 
-Services are grouped into tiers (Frontier / Strong / Fast) based on ELO. The router always tries tier 1 first and falls back only when all tier-1 services are circuit-broken or quota-exhausted.
+- **normalized_elo** — ELO score mapped to [0.60, 1.00]. Source priority: (1) `data/coding_benchmarks.json` blended score (Arena + Aider + SWE-bench) if present, (2) live Arena AI Code leaderboard (24h cached), (3) 0.85 default.
+- **thinking_mult** — 1.00 (none/low) | 1.07 (medium) | 1.15 (high). Applies when `thinking_level` is set on the service.
+- **cli_capability** — harness amplification factor set in `config.yaml`. Captures how much the agentic scaffold adds beyond raw model ELO. Reference points: `claude_code` 1.10, `codex` 1.08, `cursor` 1.05, `gemini_cli` 1.00.
+- **capabilities** — per-service relative strength for `execute` / `plan` / `review`. 1.0 = best in class; values below 1.0 represent weaker fit for that task type.
+- **quota_score** — live availability [0, 1], tracked automatically per service.
+- **weight** — static preference multiplier from config (default 1.0).
+
+Services are grouped into tiers (Frontier / Strong / Fast) based on ELO. The router always tries tier 1 first and falls back only when all tier-1 services are circuit-broken or quota-exhausted. Tier thresholds: ELO >= 1350 = tier 1, ELO >= 1200 = tier 2, ELO < 1200 = tier 3. When `thinking_level: high` is set, the threshold relaxes by 25 ELO points.
+
+### Model escalation
+
+A service can automatically escalate to a stronger model for reasoning-heavy task types:
+
+```yaml
+claude_code_sonnet:
+  model: claude-sonnet-4-6
+  escalate_model: claude-opus-4-6
+  escalate_on: [plan, review]   # Sonnet for execute, Opus for plan/review
+```
+
+`code_auto` resolves the right model per task before dispatch, so you get Sonnet speed on execution and Opus depth on design decisions without manual switching.
 
 ## Prerequisites
 
@@ -69,7 +84,7 @@ Services are grouped into tiers (Frontier / Strong / Fast) based on ELO. The rou
 
 ### Option A: npm (recommended)
 
-No cloning or Python setup needed. The npm wrapper installs the Python package on demand.
+No cloning or Python setup needed. The npm wrapper installs the Python package on demand via `uvx`.
 
 ```bash
 # One-time setup
@@ -118,37 +133,39 @@ export GEMINI_API_KEY="your-api-key"
 
 ## Configuration
 
-Configure services in `config.yaml` at the project root (or set `CODING_AGENT_CONFIG` env var for a custom path):
+The server works with no config file at all — on startup it probes your PATH for installed CLIs (`claude`, `codex`, `gemini`, `agent`) and uses built-in defaults for each one found.
+
+If you need to pass an API key or tweak something, create a `config.yaml` (or point `CODING_AGENT_CONFIG` to a custom path):
 
 ```yaml
-timeout_seconds: 120
-quota_cache_ttl: 300
-state_file: quota_state.json
-
-services:
-  claude_code_opus:
-    enabled: true
-    harness: claude_code
-    model: claude-opus-4-6
-    tier: 1
-    leaderboard_model: "claude-opus-4-6"
-    cli_capability: 1.10
-    weight: 1.0
-    capabilities:
-      execute: 0.96
-      plan: 1.0
-      review: 1.0
-  
-  cursor_sonnet:
-    enabled: true
-    harness: cursor
-    model: claude-sonnet-4-6
-    tier: 2
-    cli_capability: 1.05
-    weight: 1.0
+# Minimal — just supply the Gemini API key
+gemini_api_key: ${GEMINI_API_KEY}
 ```
 
-See `config.yaml` for more examples and OpenAI-compatible endpoint setup.
+That's it for most setups. Other available fields:
+
+```yaml
+# Skip a CLI even if it's installed
+disabled: [cursor]
+
+# Add local or third-party endpoints that can't be auto-detected
+endpoints:
+  - name: ollama
+    base_url: http://localhost:11434/v1
+    model: llama3.2
+    tier: 3
+
+# Tweak auto-detected defaults without a full config
+overrides:
+  claude_code:
+    weight: 1.2
+  gemini_cli:
+    thinking_level: medium
+```
+
+### Advanced configuration
+
+For full control — custom models per service, multiple entries per harness, per-task capability scores, model escalation — see `config.example.yaml`. That format is also fully supported: if your config file has a `services:` key the server uses it as-is.
 
 ## Claude Desktop / Cursor Integration
 
@@ -173,7 +190,7 @@ Edit `~/Library/Application Support/Claude/claude_desktop_config.json`:
 
 ### Windows
 
-Edit `%APPDATA%\Claude\claude_desktop_config.json` (use full path if npx not in PATH):
+Edit `%APPDATA%\Claude\claude_desktop_config.json`:
 
 ```json
 {
@@ -211,7 +228,7 @@ Restart Claude Desktop after updating the config.
 
 ## Adding a new service
 
-Any (model, harness) combination can be added to `config.yaml`:
+Any (model, harness) combination can be added to `config.yaml`. The `harness` field selects the dispatcher; the `model` string is passed via `--model` to the CLI. Each enabled entry auto-generates a `code_with_<name>` MCP tool.
 
 ```yaml
 cursor_opus:
@@ -229,7 +246,18 @@ cursor_opus:
     review:  0.96
 ```
 
-OpenAI-compatible local endpoints (Ollama, LM Studio, OpenRouter) are also supported — each enabled entry auto-generates a `code_with_<name>` tool. See the commented examples at the bottom of `config.yaml`.
+OpenAI-compatible local endpoints (Ollama, LM Studio, OpenRouter) are also supported:
+
+```yaml
+ollama_local:
+  enabled: true
+  type: openai_compatible
+  base_url: http://localhost:11434/v1
+  model: llama3.2
+  api_key: ""
+  tier: 3
+  weight: 0.6
+```
 
 ## Cowork Plugin
 
