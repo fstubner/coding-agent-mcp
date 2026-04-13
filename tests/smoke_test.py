@@ -21,7 +21,6 @@ import json
 import os
 import sys
 import tempfile
-import textwrap
 import time
 import unittest
 from pathlib import Path
@@ -30,14 +29,14 @@ from unittest.mock import AsyncMock, MagicMock, patch
 # Make src importable when run from project root
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
-from coding_agent.config import load_config, RouterConfig, ServiceConfig, default_config_path
-from coding_agent.dispatchers.base import UNKNOWN_QUOTA, DispatchResult, QuotaInfo
+from coding_agent.config import load_config, load_config_auto, RouterConfig, ServiceConfig, default_config_path
+from coding_agent.dispatchers.base import UNKNOWN_QUOTA, QuotaInfo
 from coding_agent.dispatchers.utils import build_prompt_with_files, _MAX_FILE_BYTES
 from coding_agent.dispatchers.cursor import CursorDispatcher, _detect_rate_limit
 from coding_agent.dispatchers.gemini import _gemini_thinking_override, _settings_lock
 from coding_agent.leaderboard import LeaderboardCache
 from coding_agent.quota import QuotaCache
-from coding_agent.router import Router, RoutingDecision
+from coding_agent.router import Router
 
 
 # ---------------------------------------------------------------------------
@@ -59,8 +58,8 @@ def _make_config(**overrides) -> RouterConfig:
             cli_capability=1.05,
             capabilities={"execute": 1.00, "plan": 0.82, "review": 0.90},
         ),
-        "gpt54_codex": ServiceConfig(
-            name="gpt54_codex", enabled=True, harness="codex",
+        "codex_gpt54": ServiceConfig(
+            name="codex_gpt54", enabled=True, harness="codex",
             command="codex", model="gpt-5.4", tier=1,
             cli_capability=1.08,
             capabilities={"execute": 1.00, "plan": 0.83, "review": 0.82},
@@ -90,17 +89,29 @@ def _make_router(config=None):
 # 1. Config loading
 # ---------------------------------------------------------------------------
 
+def _example_config_path() -> str:
+    """Path to config.example.yaml (the full-format reference config)."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(here, "..", "config.example.yaml")
+
+
 class TestConfigLoading(unittest.TestCase):
 
-    def test_real_config_loads(self):
-        """config.yaml must parse without errors."""
-        config = load_config(default_config_path())
+    def test_example_config_loads(self):
+        """config.example.yaml (full format) must parse without errors."""
+        config = load_config(_example_config_path())
         self.assertIsInstance(config, RouterConfig)
         self.assertGreater(len(config.services), 0)
 
+    def test_minimal_config_auto_loads(self):
+        """load_config_auto with the minimal config.yaml must not crash."""
+        config = load_config_auto(default_config_path())
+        self.assertIsInstance(config, RouterConfig)
+        # May have 0 services in CI where no CLIs are installed — just no crash
+
     def test_harness_field_parsed(self):
-        config = load_config(default_config_path())
-        # Every enabled service in the new config has an explicit harness
+        config = load_config(_example_config_path())
+        # Every enabled service in the full config has an explicit harness
         for name, svc in config.services.items():
             if svc.enabled:
                 self.assertIsNotNone(svc.harness,
@@ -108,20 +119,20 @@ class TestConfigLoading(unittest.TestCase):
 
     def test_harness_values_are_valid(self):
         valid = {"claude_code", "cursor", "codex", "gemini_cli", "openai_compatible", None}
-        config = load_config(default_config_path())
+        config = load_config(_example_config_path())
         for name, svc in config.services.items():
             self.assertIn(svc.harness, valid,
                 f"{name}: unexpected harness value '{svc.harness}'")
 
     def test_cursor_services_have_model(self):
-        config = load_config(default_config_path())
+        config = load_config(_example_config_path())
         for name, svc in config.services.items():
             if svc.enabled and svc.harness == "cursor":
                 self.assertIsNotNone(svc.model,
                     f"{name}: cursor harness service must specify a model")
 
     def test_optional_str_fields_are_none_or_str(self):
-        config = load_config(default_config_path())
+        config = load_config(_example_config_path())
         for name, svc in config.services.items():
             for attr in ("harness", "model", "api_key", "leaderboard_model",
                          "escalate_model", "thinking_level"):
@@ -146,7 +157,7 @@ class TestDispatcherFactory(unittest.TestCase):
             self.assertIn(key, self.factories, f"Missing harness key: {key}")
 
     def test_build_from_real_config(self):
-        config = load_config(default_config_path())
+        config = load_config(_example_config_path())
         dispatchers = self.build(config)
         self.assertGreater(len(dispatchers), 0)
 
@@ -155,7 +166,7 @@ class TestDispatcherFactory(unittest.TestCase):
         from coding_agent.dispatchers.cursor import CursorDispatcher
         from coding_agent.dispatchers.codex import CodexDispatcher
         from coding_agent.dispatchers.gemini import GeminiDispatcher
-        config = load_config(default_config_path())
+        config = load_config(_example_config_path())
         dispatchers = self.build(config)
         harness_to_type = {
             "claude_code": ClaudeCodeDispatcher,
@@ -196,8 +207,8 @@ class TestRouter(unittest.IsolatedAsyncioTestCase):
     async def test_execute_prefers_high_cap(self):
         d = await self.router.pick_service(hints={"task_type": "execute"})
         self.assertIsNotNone(d)
-        # cursor_sonnet and gpt54_codex both have execute cap=1.0; one of them wins
-        self.assertIn(d.service, ("cursor_sonnet", "gpt54_codex", "claude_code_opus"))
+        # cursor_sonnet and codex_gpt54 both have execute cap=1.0; one of them wins
+        self.assertIn(d.service, ("cursor_sonnet", "codex_gpt54", "claude_code_opus"))
 
     async def test_harness_filter_claude_code(self):
         d = await self.router.pick_service(hints={"harness": "claude_code"})
@@ -212,7 +223,7 @@ class TestRouter(unittest.IsolatedAsyncioTestCase):
     async def test_harness_filter_codex(self):
         d = await self.router.pick_service(hints={"harness": "codex"})
         self.assertIsNotNone(d)
-        self.assertEqual(d.service, "gpt54_codex")
+        self.assertEqual(d.service, "codex_gpt54")
 
     async def test_harness_filter_unknown_returns_none(self):
         d = await self.router.pick_service(hints={"harness": "nonexistent_harness"})
@@ -366,7 +377,6 @@ class TestQuotaFileWrite(unittest.IsolatedAsyncioTestCase):
         try:
             cache = QuotaCache(dispatchers=dispatchers, ttl=9999, state_file=state_file)
             executor_calls = []
-            original = cache._save_local_counts
 
             async def fake_run_in_executor(executor, fn, *args):
                 executor_calls.append(fn)
@@ -483,7 +493,6 @@ class TestDiagnoseDelegate(unittest.TestCase):
 
     def test_diagnose_calls_build_dashboard(self):
         """_diagnose() must call _build_dashboard(), not duplicate its logic."""
-        import ast, textwrap
         main_path = os.path.join(
             os.path.dirname(__file__), "..", "src",
             "coding_agent", "__main__.py"
@@ -509,8 +518,6 @@ class TestTypeAnnotations(unittest.TestCase):
                 continue
             param = sig.parameters[param_name]
             annotation = param.annotation
-            # str | None appears as typing.str | None — check it's not bare str
-            ann_str = str(annotation)
             self.assertNotIn("= None", "")  # placeholder
             # The real check: annotation should not be bare str (which is str, not Optional)
             self.assertNotEqual(annotation, str,
@@ -546,7 +553,6 @@ class TestNoInlineImports(unittest.TestCase):
     def _check_no_inline_imports(self, module_path: str):
         source = Path(module_path).read_text()
         lines = source.splitlines()
-        src_root = os.path.join(os.path.dirname(__file__), "..", "src", "coding_agent")
         for i, line in enumerate(lines, 1):
             stripped = line.lstrip()
             indent = len(line) - len(stripped)
