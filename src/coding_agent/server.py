@@ -11,7 +11,7 @@ import time
 import mcp.types as types
 from mcp.server import Server
 
-from .config import load_config, default_config_path
+from .config import load_config_auto, default_config_path
 from .quota import QuotaCache
 from .leaderboard import LeaderboardCache
 from .dispatchers.gemini import GeminiDispatcher
@@ -70,7 +70,7 @@ def _build_dispatchers(config):
 
 _config_path = default_config_path()
 _config_mtime: float = 0.0
-_config = load_config(_config_path)
+_config = load_config_auto(_config_path)
 _dispatchers = _build_dispatchers(_config)
 _quota = QuotaCache(
     dispatchers=_dispatchers,
@@ -361,7 +361,9 @@ async def _maybe_reload_config() -> bool:
     """
     global _config, _dispatchers, _quota, _router, _config_mtime
 
-    # Fast path — skip the lock if the file hasn't changed
+    # Fast path — skip the lock if there's no config file or it hasn't changed
+    if not _config_path:
+        return False
     try:
         mtime = os.path.getmtime(_config_path)
     except OSError:
@@ -379,7 +381,7 @@ async def _maybe_reload_config() -> bool:
             return False
 
         try:
-            new_config = load_config(_config_path)
+            new_config = load_config_auto(_config_path)
         except Exception:
             return False  # don't crash on a malformed config edit
 
@@ -1244,7 +1246,7 @@ Each service is a (model, harness) pair. "Harness" is the CLI agent scaffold:
 |--------------------|-----------------------------|---------|------|--------|
 | claude_code_opus   | claude-opus-4-6             |   93%   | 100% |  100%  |
 | claude_code_sonnet | claude-sonnet-4-6           |   96%   |  85% |   88%  |
-| gpt54_codex        | gpt-5.4                     |  100%   |  83% |   82%  |
+| codex_gpt54        | gpt-5.4                     |  100%   |  83% |   82%  |
 | gemini31pro        | gemini-3.1-pro-preview      |   87%   |  97% |   95%  |
 | cursor_sonnet      | claude-sonnet-4-6 (cursor)  |  100%   |  82% |   90%  |
 
@@ -1263,7 +1265,7 @@ The router picks the highest-scoring service within the best available tier.
 ## When to use each tool
 
 **code_auto** — best for most tasks; use task_type hint to route objectively:
-  `{"task_type": "execute"}` → gpt54_codex (100%) or cursor_sonnet (100%)
+  `{"task_type": "execute"}` → codex_gpt54 (100%) or cursor_sonnet (100%)
   `{"task_type": "plan"}`   → claude_code_opus (100%) or gemini31pro (97%)
   `{"task_type": "review"}` → claude_code_opus (100%) or gemini31pro (95%)
   `{"harness": "cursor"}`   → restrict to cursor-harness services only

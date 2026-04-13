@@ -2,6 +2,7 @@
 
 import os
 import re
+import shutil
 from dataclasses import dataclass, field
 
 import yaml
@@ -13,8 +14,6 @@ class ServiceConfig:
     type: str = "cli"               # "cli" | "openai_compatible"
     # harness: which dispatcher class to use. Defaults to service name for backward compat.
     # Canonical values: "claude_code" | "cursor" | "codex" | "gemini_cli" | "openai_compatible"
-    # Set this when you want multiple services using the same CLI but different models,
-    # e.g. cursor_sonnet + cursor_opus both have harness: cursor but different model: strings.
     harness: str | None = None
     # CLI fields
     command: str = ""
@@ -26,57 +25,19 @@ class ServiceConfig:
     # Routing weight (score multiplier within a tier)
     weight: float = 1.0
     # Tier — lower number = higher quality = tried first.
-    # Tier 1: frontier  (Claude Opus 4.6, GPT-5.4, Gemini 3.1 Pro)
-    # Tier 2: strong    (Claude Sonnet, GPT-5.3-Codex, Gemini 2.5 Pro)
-    # Tier 3: fast/local (Claude Haiku, GPT-5.4-Mini, Gemini 2.5 Flash, Ollama)
     tier: int = 1
     # thinking_level: controls reasoning depth for supported models.
     # Values: "low" | "medium" | "high" | None (use model default)
-    # — Gemini CLI: injected into ~/.gemini/settings.json as thinkingLevel (LOW/MEDIUM/HIGH)
-    # — OpenAI-compatible: sent as reasoning_effort in the request body
-    # — Claude Code: passed as --thinking-budget flag (if supported by installed version)
-    # — Codex CLI: no direct flag; use model choice (gpt-5.4 vs gpt-5.4-mini) instead
     thinking_level: str | None = None
-    # leaderboard_model: Arena AI model ID to look up for ELO-based quality scoring.
-    # Uses the code-specific Arena leaderboard (human coding preference votes).
-    # Case-insensitive substring match against the API model identifiers.
-    # Examples: "claude-opus-4-6", "gemini-3.1-pro-preview", "gpt-5.4"
-    # Omit (or set to null) to use the explicit tier and default quality weight.
+    # leaderboard_model: Arena AI model ID for ELO-based quality scoring.
     leaderboard_model: str | None = None
-    # cli_capability: multiplier [0.0 – 1.5] capturing how much the CLI agent
-    # wrapper amplifies (or limits) the base model's coding ability.
-    # The same model called raw vs. through Claude Code's scaffolding vs. through
-    # Cursor's agent loop may produce very different real-world results.
-    # 1.0  = baseline (raw model, no agentic scaffolding)
-    # >1.0 = CLI adds significant value (tool use, file ops, auto-retry, etc.)
-    # <1.0 = CLI limits throughput or has quality regressions
-    #
-    # Reference points (based on SWE-bench Verified April 2026):
-    #   claude_code: ~1.10  — dedicated agentic scaffold, strong file editing
-    #   codex:       ~1.08  — full-auto exec with test runner + code execution
-    #   cursor:      ~1.05  — editor-aware agent, good for file modifications
-    #   gemini:      ~1.00  — direct API thin wrapper, minimal scaffolding
+    # cli_capability: multiplier capturing how much the CLI scaffold adds beyond raw ELO.
     cli_capability: float = 1.0
     # escalate_model: optional model to use for reasoning-heavy task types.
-    # When task_type is in escalate_on, the router swaps model for escalate_model.
-    # Example: model=claude-sonnet-4-6, escalate_model=claude-opus-4-6
-    #          → Sonnet for execute, Opus for plan/review
     escalate_model: str | None = None
-    # escalate_on: which task types trigger model escalation (default: plan, review)
+    # escalate_on: task types that trigger model escalation (default: plan, review)
     escalate_on: list[str] = field(default_factory=lambda: ["plan", "review"])
     # capabilities: per-task-type relative strength scores [0.0 – 1.0].
-    # Used by the router to pick the best service for a given task type.
-    # Keys: "execute" | "plan" | "review"
-    #
-    #   execute — autonomous multi-step coding (SWE-bench, CI-style tasks)
-    #   plan    — architecture, design decisions, reasoning-heavy analysis
-    #   review  — code review, explanation, refactor suggestions
-    #
-    # Score of 1.0 = best in class for that task type. These are relative
-    # within the set of configured services, not absolute percentages.
-    #
-    # Default (all 1.0) means the service is treated as equally capable
-    # across all task types — only ELO + cli_capability differentiate it.
     capabilities: dict[str, float] = field(default_factory=lambda: {
         "execute": 1.0,
         "plan": 1.0,
@@ -90,6 +51,52 @@ class RouterConfig:
     quota_cache_ttl: int = 300
     state_file: str = "quota_state.json"
 
+# ---------------------------------------------------------------------------
+# Built-in defaults for auto-detected CLIs
+# ---------------------------------------------------------------------------
+# These are the sensible defaults applied when a CLI is found on PATH.
+# Users can override any field via the `overrides` section in config.yaml.
+
+_CLI_DEFAULTS: dict[str, dict] = {
+    "claude_code": {
+        "command": "claude",
+        "harness": "claude_code",
+        "leaderboard_model": "claude-opus-4-6",
+        "cli_capability": 1.10,
+        "tier": 1,
+        "capabilities": {"execute": 0.95, "plan": 1.0, "review": 1.0},
+    },
+    "codex": {
+        "command": "codex",
+        "harness": "codex",
+        "leaderboard_model": "gpt-5.4",
+        "cli_capability": 1.08,
+        "tier": 1,
+        "capabilities": {"execute": 1.0, "plan": 0.83, "review": 0.82},
+    },
+    "cursor": {
+        "command": "agent",
+        "harness": "cursor",
+        "leaderboard_model": "claude-sonnet-4-6",
+        "cli_capability": 1.05,
+        "tier": 1,
+        "capabilities": {"execute": 1.0, "plan": 0.82, "review": 0.90},
+    },
+    "gemini_cli": {
+        "command": "gemini",
+        "harness": "gemini_cli",
+        "leaderboard_model": "gemini-3.1-pro-preview",
+        "cli_capability": 1.00,
+        "tier": 1,
+        "thinking_level": "high",
+        "capabilities": {"execute": 0.87, "plan": 0.97, "review": 0.95},
+    },
+}
+
+# ---------------------------------------------------------------------------
+# Environment variable interpolation
+# ---------------------------------------------------------------------------
+
 _ENV_VAR_RE = re.compile(r"^\$\{([A-Za-z_][A-Za-z0-9_]*)\}$")
 
 def _resolve(value: str | None) -> str | None:
@@ -98,19 +105,21 @@ def _resolve(value: str | None) -> str | None:
         return value
     m = _ENV_VAR_RE.match(str(value))
     if m:
-        resolved = os.environ.get(m.group(1))
-        return resolved  # None if env var not set
+        return os.environ.get(m.group(1))
     return value
 
+# ---------------------------------------------------------------------------
+# Legacy full-format loader (backwards compat)
+# ---------------------------------------------------------------------------
+
 def load_config(path: str) -> RouterConfig:
-    """Load RouterConfig from a YAML file."""
+    """Load RouterConfig from a YAML file with a top-level `services:` key."""
     with open(path, "r", encoding="utf-8") as f:
         raw = yaml.safe_load(f)
 
     services = {}
     for name, svc in (raw.get("services") or {}).items():
         svc_type = svc.get("type", "cli")
-        # Parse per-task-type capability scores
         raw_caps = svc.get("capabilities") or {}
         capabilities = {
             "execute": float(raw_caps.get("execute", 1.0)),
@@ -145,11 +154,153 @@ def load_config(path: str) -> RouterConfig:
         state_file=raw.get("state_file", "quota_state.json"),
     )
 
-def default_config_path() -> str:
-    """Resolve config path from env var or relative to project root."""
+# ---------------------------------------------------------------------------
+# Auto-detect loader (new default)
+# ---------------------------------------------------------------------------
+
+def _detect_services(
+    disabled: list[str],
+    api_keys: dict[str, str],
+    overrides: dict[str, dict],
+) -> dict[str, ServiceConfig]:
+    """Probe PATH for known CLIs and build ServiceConfig entries for each found."""
+    services = {}
+    for name, defaults in _CLI_DEFAULTS.items():
+        if name in disabled:
+            continue
+        if not shutil.which(defaults["command"]):
+            continue
+        caps = dict(defaults.get("capabilities", {}))
+        override = overrides.get(name, {})
+        # Apply override capabilities on top of defaults
+        if "capabilities" in override:
+            caps.update(override.pop("capabilities"))
+        # Merge override fields
+        merged = {**defaults, **override}
+        services[name] = ServiceConfig(
+            name=name,
+            enabled=True,
+            type="cli",
+            harness=merged.get("harness"),
+            command=merged["command"],
+            api_key=api_keys.get(name),
+            model=merged.get("model"),
+            weight=float(merged.get("weight", 1.0)),
+            tier=int(merged.get("tier", 1)),
+            thinking_level=merged.get("thinking_level"),
+            leaderboard_model=merged.get("leaderboard_model"),
+            cli_capability=float(merged.get("cli_capability", 1.0)),
+            capabilities=caps,
+            escalate_model=merged.get("escalate_model"),
+            escalate_on=merged.get("escalate_on", ["plan", "review"]),
+        )
+    return services
+
+
+def load_config_auto(path: str | None = None) -> RouterConfig:
+    """
+    Build a RouterConfig by auto-detecting installed CLIs, with optional overrides
+    from a minimal config file.
+
+    If `path` points to a file with a `services:` key, falls back to load_config()
+    for full backwards compatibility.
+
+    Minimal config file format (all fields optional):
+
+        gemini_api_key: ${GEMINI_API_KEY}   # or any api_key_<name>: ...
+        disabled: [cursor]                   # CLIs to skip even if installed
+        endpoints:                           # local/third-party (can't be auto-detected)
+          - name: ollama
+            base_url: http://localhost:11434/v1
+            model: llama3.2
+            tier: 3
+        overrides:                           # applied on top of auto-detected defaults
+          claude_code:
+            weight: 1.2
+        timeout_seconds: 120
+        quota_cache_ttl: 300
+    """
+    raw: dict = {}
+    if path and os.path.exists(path):
+        with open(path, "r", encoding="utf-8") as f:
+            raw = yaml.safe_load(f) or {}
+        # Backwards compat: full format has a `services:` key
+        if "services" in raw:
+            return load_config(path)
+
+    disabled: list[str] = list(raw.get("disabled") or [])
+    overrides: dict[str, dict] = dict(raw.get("overrides") or {})
+
+    # Collect API keys — support both `gemini_api_key` shorthand and `api_keys:` dict
+    api_keys: dict[str, str] = {}
+    raw_api_keys = raw.get("api_keys") or {}
+    for k, v in raw_api_keys.items():
+        resolved = _resolve(str(v))
+        if resolved:
+            api_keys[k] = resolved
+    # Shorthand: gemini_api_key, codex_api_key, etc.
+    for name in _CLI_DEFAULTS:
+        shorthand_key = f"{name}_api_key"
+        if shorthand_key in raw:
+            resolved = _resolve(str(raw[shorthand_key]))
+            if resolved:
+                api_keys[name] = resolved
+    # Top-level gemini_api_key is the most common case
+    if "gemini_api_key" in raw:
+        resolved = _resolve(str(raw["gemini_api_key"]))
+        if resolved:
+            api_keys["gemini_cli"] = resolved
+    # Also check env directly for Gemini
+    if "gemini_cli" not in api_keys:
+        gemini_env = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+        if gemini_env:
+            api_keys["gemini_cli"] = gemini_env
+
+    services = _detect_services(disabled, api_keys, overrides)
+
+    # Local/third-party endpoints
+    for ep in (raw.get("endpoints") or []):
+        name = ep.get("name")
+        if not name or not ep.get("base_url") or not ep.get("model"):
+            continue
+        raw_caps = ep.get("capabilities") or {}
+        services[name] = ServiceConfig(
+            name=name,
+            enabled=ep.get("enabled", True),
+            type="openai_compatible",
+            base_url=ep["base_url"],
+            model=ep["model"],
+            api_key=_resolve(ep.get("api_key", "")),
+            weight=float(ep.get("weight", 0.6)),
+            tier=int(ep.get("tier", 3)),
+            leaderboard_model=ep.get("leaderboard_model"),
+            capabilities={
+                "execute": float(raw_caps.get("execute", 1.0)),
+                "plan":    float(raw_caps.get("plan",    1.0)),
+                "review":  float(raw_caps.get("review",  1.0)),
+            },
+        )
+
+    return RouterConfig(
+        services=services,
+        timeout_seconds=int(raw.get("timeout_seconds", 120)),
+        quota_cache_ttl=int(raw.get("quota_cache_ttl", 300)),
+        state_file=str(raw.get("state_file", "quota_state.json")),
+    )
+
+# ---------------------------------------------------------------------------
+# Path resolution
+# ---------------------------------------------------------------------------
+
+def default_config_path() -> str | None:
+    """
+    Resolve config path from env var or look for config.yaml at project root.
+    Returns None if no config file is found (auto-detect with no overrides).
+    """
     env = os.environ.get("CODING_AGENT_CONFIG")
     if env:
         return env
     here = os.path.dirname(os.path.abspath(__file__))
     project_root = os.path.dirname(os.path.dirname(here))
-    return os.path.join(project_root, "config.yaml")
+    candidate = os.path.join(project_root, "config.yaml")
+    return candidate if os.path.exists(candidate) else None
