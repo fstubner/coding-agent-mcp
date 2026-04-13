@@ -39,5 +39,5 @@ src/coding_router/
 # Backup files from refactor
 *.bak
 
-# Local Claude Code settings
-.claude/settings.local.json
+# Claude Code (settings and worktrees)
+.claude/
