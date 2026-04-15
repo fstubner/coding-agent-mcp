@@ -1,13 +1,19 @@
 #!/usr/bin/env node
 /**
- * coding-agent-mcp — minimal R1 CLI demo.
+ * coding-agent-mcp — CLI entrypoint.
  *
  * Usage:
- *   tsx src/bin.ts route "<prompt>"     Pick a service and dispatch.
- *   tsx src/bin.ts list-services        Show enabled services.
- *   tsx src/bin.ts dashboard            Show quota + breaker status.
+ *   coding-agent-mcp route "<prompt>"        Pick a service and dispatch once.
+ *   coding-agent-mcp list-services           Show enabled services.
+ *   coding-agent-mcp dashboard               Show quota + breaker status.
+ *   coding-agent-mcp mcp                     Start the MCP server on stdio.
+ *   coding-agent-mcp mcp --http <port>       Start the MCP server over HTTP.
  *
- * The full MCP server lives in R2. This is a single-command demo.
+ * Options (apply to all subcommands):
+ *   --config <path>   Path to config.yaml (default: auto-detect).
+ *
+ * R1 defined `route / list-services / dashboard`. R2 adds the `mcp` subcommand
+ * while keeping the R1 behaviour identical.
  */
 
 import { parseArgs } from "node:util";
@@ -15,79 +21,11 @@ import { Router } from "./router.js";
 import { loadConfig } from "./config.js";
 import { QuotaCache } from "./quota.js";
 import { LeaderboardCache } from "./leaderboard.js";
-import type { Dispatcher } from "./dispatchers/base.js";
-import type { RouterConfig, ServiceConfig } from "./types.js";
-
-/**
- * Build a dispatcher map for every enabled service in the config.
- *
- * R1 scope is minimal — this imports dispatcher factories lazily so that
- * adding a new dispatcher type doesn't break the CLI when the module isn't
- * present. The factory returns `undefined` if the dispatcher can't be built
- * in the current environment.
- */
-async function buildDispatchers(
-  config: RouterConfig,
-): Promise<Record<string, Dispatcher>> {
-  const out: Record<string, Dispatcher> = {};
-  for (const [name, svc] of Object.entries(config.services)) {
-    if (!svc.enabled) continue;
-    const d = await makeDispatcher(name, svc);
-    if (d) out[name] = d;
-  }
-  return out;
-}
-
-/**
- * Lazily import a dispatcher module by relative path.
- *
- * Uses a variable specifier + `@ts-ignore` for the missing type declarations
- * because these modules are owned by other agents and may not exist yet.
- */
-async function loadDispatcherModule(
-  relPath: string,
-): Promise<Record<string, new (svc: ServiceConfig) => Dispatcher> | undefined> {
-  try {
-    // @ts-ignore - dynamic specifier; modules land at merge time.
-    const mod = (await import(relPath)) as Record<
-      string,
-      new (svc: ServiceConfig) => Dispatcher
-    >;
-    return mod;
-  } catch {
-    return undefined;
-  }
-}
-
-async function makeDispatcher(
-  name: string,
-  svc: ServiceConfig,
-): Promise<Dispatcher | undefined> {
-  const harness = svc.harness ?? name;
-  const table: Record<string, { path: string; exportName: string }> = {
-    claude_code: { path: "./dispatchers/claude_code.js", exportName: "ClaudeCodeDispatcher" },
-    cursor: { path: "./dispatchers/cursor.js", exportName: "CursorDispatcher" },
-    codex: { path: "./dispatchers/codex.js", exportName: "CodexDispatcher" },
-    gemini_cli: { path: "./dispatchers/gemini_cli.js", exportName: "GeminiCliDispatcher" },
-    gemini: { path: "./dispatchers/gemini_cli.js", exportName: "GeminiCliDispatcher" },
-  };
-  const entry = table[harness];
-  if (entry) {
-    const mod = await loadDispatcherModule(entry.path);
-    const Ctor = mod?.[entry.exportName];
-    if (Ctor) return new Ctor(svc);
-    return undefined;
-  }
-  if (svc.type === "openai_compatible") {
-    const mod = await loadDispatcherModule("./dispatchers/openai_compatible.js");
-    const Ctor = mod?.OpenAiCompatibleDispatcher;
-    if (Ctor) return new Ctor(svc);
-  }
-  return undefined;
-}
+import { buildDispatchers } from "./mcp/dispatcher-factory.js";
+import { startMcpHttpServer, startMcpServer } from "./mcp/server.js";
 
 // ---------------------------------------------------------------------------
-// Commands
+// Commands (R1)
 // ---------------------------------------------------------------------------
 
 async function cmdRoute(prompt: string, configPath: string | undefined): Promise<number> {
@@ -169,6 +107,56 @@ async function cmdDashboard(configPath: string | undefined): Promise<number> {
 }
 
 // ---------------------------------------------------------------------------
+// Commands (R2 — MCP server)
+// ---------------------------------------------------------------------------
+
+async function cmdMcp(
+  configPath: string | undefined,
+  httpPort: number | undefined,
+): Promise<number> {
+  if (httpPort !== undefined) {
+    const buildOpts: { configPath?: string } = {};
+    if (configPath !== undefined) buildOpts.configPath = configPath;
+    const handle = await startMcpHttpServer({ ...buildOpts, port: httpPort });
+    process.stderr.write(
+      `coding-agent-mcp listening on http://localhost:${handle.port}/mcp\n`,
+    );
+    const shutdown = async (): Promise<void> => {
+      try {
+        await handle.close();
+      } finally {
+        process.exit(0);
+      }
+    };
+    process.on("SIGINT", () => void shutdown());
+    process.on("SIGTERM", () => void shutdown());
+    // Block forever — the HTTP server keeps the event loop alive anyway.
+    await new Promise<void>(() => {
+      /* intentionally never resolves */
+    });
+    return 0;
+  }
+
+  const buildOpts: { configPath?: string } = {};
+  if (configPath !== undefined) buildOpts.configPath = configPath;
+  const handle = await startMcpServer(buildOpts);
+  const shutdown = async (): Promise<void> => {
+    try {
+      await handle.close();
+    } finally {
+      process.exit(0);
+    }
+  };
+  process.on("SIGINT", () => void shutdown());
+  process.on("SIGTERM", () => void shutdown());
+  // stdio transport keeps the process alive on its own.
+  await new Promise<void>(() => {
+    /* intentionally never resolves */
+  });
+  return 0;
+}
+
+// ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
 
@@ -181,6 +169,8 @@ function printUsage(): void {
       '  coding-agent-mcp route "<prompt>"   Pick a service and dispatch.',
       "  coding-agent-mcp list-services      Show enabled services.",
       "  coding-agent-mcp dashboard          Show quota + breaker status.",
+      "  coding-agent-mcp mcp                Start the MCP server (stdio).",
+      "  coding-agent-mcp mcp --http <port>  Start the MCP server (HTTP).",
       "",
       "Options:",
       "  --config <path>   Path to config.yaml (default: auto-detect)",
@@ -194,6 +184,7 @@ export async function main(argv: string[]): Promise<number> {
     args: argv,
     options: {
       config: { type: "string" },
+      http: { type: "string" },
       help: { type: "boolean", short: "h" },
     },
     allowPositionals: true,
@@ -221,6 +212,18 @@ export async function main(argv: string[]): Promise<number> {
       return cmdListServices(configPath);
     case "dashboard":
       return cmdDashboard(configPath);
+    case "mcp": {
+      let httpPort: number | undefined;
+      if (values.http !== undefined) {
+        const parsed = Number(values.http);
+        if (Number.isNaN(parsed)) {
+          process.stderr.write(`mcp --http: expected a port number, got "${values.http}"\n`);
+          return 1;
+        }
+        httpPort = parsed;
+      }
+      return cmdMcp(configPath, httpPort);
+    }
     default:
       process.stderr.write(`unknown command: ${command}\n`);
       printUsage();
@@ -229,10 +232,8 @@ export async function main(argv: string[]): Promise<number> {
 }
 
 // When invoked directly (not imported), run and set exit code.
-// Use a runtime check that tsx/node recognizes.
 const entrypoint =
   typeof process !== "undefined" && Array.isArray(process.argv) ? process.argv[1] : "";
-// import.meta.url check would be preferred but keep it simple: run if we're the main module.
 if (entrypoint && (entrypoint.endsWith("bin.ts") || entrypoint.endsWith("bin.js"))) {
   void main(process.argv.slice(2)).then((code) => {
     process.exit(code);
