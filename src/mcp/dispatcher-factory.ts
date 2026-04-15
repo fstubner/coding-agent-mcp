@@ -50,19 +50,19 @@ const HARNESS_TABLE: Record<string, { path: string; exportName: string }> = {
     path: "../dispatchers/codex.js",
     exportName: "CodexDispatcher",
   },
-  // Cursor + Gemini land on R2 Agent B's branch — merge picks them up via
-  // dynamic import. Paths are matched against those the peer branch creates.
+  // R2 Agent B landed Cursor / Gemini / OpenAI-compatible on `main`.
+  // Filename + class name match what's actually on disk.
   cursor: {
     path: "../dispatchers/cursor.js",
     exportName: "CursorDispatcher",
   },
   gemini_cli: {
-    path: "../dispatchers/gemini-cli.js",
-    exportName: "GeminiCliDispatcher",
+    path: "../dispatchers/gemini.js",
+    exportName: "GeminiDispatcher",
   },
   gemini: {
-    path: "../dispatchers/gemini-cli.js",
-    exportName: "GeminiCliDispatcher",
+    path: "../dispatchers/gemini.js",
+    exportName: "GeminiDispatcher",
   },
 };
 
