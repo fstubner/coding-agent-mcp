@@ -6,10 +6,12 @@
  * an `McpServer` instance. `invokeTool()` is the direct-call entry point the
  * unit tests use — it bypasses MCP transport entirely.
  *
- * The handlers are kept deliberately thin — they call into the router /
- * quota / leaderboard library code owned by R1. No business logic lives
- * here; this module is a translation layer between MCP JSON and library
- * calls.
+ * R3: code_with_*, code_auto, and code_mixture tools stream via the MCP
+ * `notifications/progress` protocol. When the caller sets `_meta.progressToken`
+ * on the request, each stdout chunk / tool_use / thinking event fires a
+ * progress notification; the final return value is still the buffered result
+ * the R2 tests expect. Static tools (dashboard / list_available_services /
+ * quota status / setup) don't stream.
  */
 
 import { promises as fs } from "node:fs";
@@ -17,10 +19,14 @@ import os from "node:os";
 import path from "node:path";
 
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
+import type {
+  CallToolResult,
+  ServerNotification,
+} from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 
-import type { RouteHints, TaskType } from "../types.js";
+import type { DispatchResult, DispatcherEvent, RouteHints, TaskType } from "../types.js";
+import { withMcpToolSpan } from "../observability/spans.js";
 import type { RuntimeHolder } from "./config-hot-reload.js";
 import type { ConfigHotReloader } from "./config-hot-reload.js";
 
@@ -177,6 +183,72 @@ async function ensureFreshConfig(reloader: ConfigHotReloader | undefined): Promi
   if (reloader) await reloader.maybeReload();
 }
 
+/**
+ * Minimal shape of the `extra` arg passed to tool handlers by the SDK.
+ * We only need `_meta.progressToken` and `sendNotification`.
+ */
+export interface ToolExtra {
+  _meta?: { progressToken?: string | number } & Record<string, unknown>;
+  sendNotification?: (notification: ServerNotification) => Promise<void>;
+}
+
+/**
+ * Emit a progress notification carrying the streaming `event`. The
+ * receiver inspects `_meta.event` to reconstruct the DispatcherEvent.
+ *
+ * We encode the per-event payload in the notification's `message` (a short
+ * human-readable summary) and attach the machine-readable event object under
+ * `_meta.event`. The `progress` field monotonically increments so the client
+ * can enforce in-order delivery.
+ */
+async function emitProgress(
+  extra: ToolExtra | undefined,
+  progressToken: string | number | undefined,
+  counter: { value: number },
+  event: DispatcherEvent,
+  service?: string,
+): Promise<void> {
+  if (!extra?.sendNotification || progressToken === undefined) return;
+  counter.value += 1;
+  const message = summarizeEvent(event, service);
+  try {
+    await extra.sendNotification({
+      method: "notifications/progress",
+      params: {
+        progressToken,
+        progress: counter.value,
+        message,
+        _meta: { event, service },
+      },
+    });
+  } catch {
+    // Best-effort notifications. A misbehaving transport shouldn't crash the
+    // tool call.
+  }
+}
+
+function summarizeEvent(event: DispatcherEvent, service?: string): string {
+  const prefix = service ? `[${service}] ` : "";
+  switch (event.type) {
+    case "stdout":
+      return `${prefix}stdout: ${truncate(event.chunk, 60)}`;
+    case "stderr":
+      return `${prefix}stderr: ${truncate(event.chunk, 60)}`;
+    case "tool_use":
+      return `${prefix}tool_use: ${event.name}`;
+    case "thinking":
+      return `${prefix}thinking: ${truncate(event.chunk, 60)}`;
+    case "completion":
+      return `${prefix}completion: ${event.result.success ? "ok" : "fail"}`;
+    case "error":
+      return `${prefix}error: ${event.error}`;
+  }
+}
+
+function truncate(s: string, n: number): string {
+  return s.length <= n ? s : `${s.slice(0, n - 3)}...`;
+}
+
 // ---------------------------------------------------------------------------
 // Tool handlers — exported for direct use in unit tests
 // ---------------------------------------------------------------------------
@@ -186,8 +258,77 @@ export interface ToolDeps {
   reloader?: ConfigHotReloader;
 }
 
-/** Run a routed dispatch and shape the result. Shared by code_auto + code_with_*. */
-async function runRouted(
+/**
+ * Run a routed dispatch via streaming, with progress notifications on
+ * every event, and shape the final result. Shared by code_auto + code_with_*.
+ */
+async function runRoutedStreaming(
+  deps: ToolDeps,
+  prompt: string,
+  files: string[],
+  workingDir: string,
+  hints: RouteHints,
+  maxFallbacks: number | undefined,
+  extra: ToolExtra | undefined,
+): Promise<RouteResponse> {
+  await ensureFreshConfig(deps.reloader);
+  const state = deps.holder.state;
+  const progressToken = extra?._meta?.progressToken;
+  const counter = { value: 0 };
+
+  const opts: { hints: RouteHints; maxFallbacks?: number } = { hints };
+  if (maxFallbacks !== undefined) opts.maxFallbacks = maxFallbacks;
+
+  let finalResult: DispatchResult | null = null;
+  let finalDecision: import("../types.js").RoutingDecision | null = null;
+
+  for await (const { event, decision } of state.router.stream(prompt, files, workingDir, opts)) {
+    if (decision) finalDecision = decision;
+    await emitProgress(extra, progressToken, counter, event, decision?.service);
+    if (event.type === "completion") finalResult = event.result;
+  }
+
+  const result: DispatchResult =
+    finalResult ??
+    ({
+      output: "",
+      service: "none",
+      success: false,
+      error: "Router stream ended without a completion event",
+    } as DispatchResult);
+
+  const response: RouteResponse = {
+    success: result.success,
+    output: result.output,
+    service: result.service,
+  };
+  if (result.error !== undefined) response.error = result.error;
+  if (result.durationMs !== undefined) response.durationMs = result.durationMs;
+  if (result.tokensUsed !== undefined) response.tokensUsed = result.tokensUsed;
+  if (finalDecision) {
+    if (finalDecision.model !== undefined) response.model = finalDecision.model;
+    response.routing = {
+      tier: finalDecision.tier,
+      quotaScore: finalDecision.quotaScore,
+      qualityScore: finalDecision.qualityScore,
+      cliCapability: finalDecision.cliCapability,
+      capabilityScore: finalDecision.capabilityScore,
+      taskType: finalDecision.taskType,
+      finalScore: finalDecision.finalScore,
+      reason: finalDecision.reason,
+      ...(finalDecision.elo !== undefined ? { elo: finalDecision.elo } : {}),
+    };
+  }
+  return response;
+}
+
+/**
+ * Buffered fallback used by the (non-streaming) test-invocation path. Still
+ * goes through the router — just uses route() instead of stream() so the
+ * existing mocks that assert dispatcher.dispatch was called once don't
+ * break.
+ */
+async function runRoutedBuffered(
   deps: ToolDeps,
   prompt: string,
   files: string[],
@@ -226,111 +367,155 @@ async function runRouted(
   return response;
 }
 
-/**
- * Dispatch to a specific harness by filtering the candidate set.
- *
- * Note: `modelOverride` is accepted on the input schema but is not currently
- * plumbed through the router — the router's per-service config (including
- * `escalateModel`) is the canonical way to pick a model. This is deliberate:
- * the router's scoring relies on knowing the model ahead of time. If per-call
- * overrides become necessary we'll extend Router.route; today this keeps the
- * MCP surface honest about what it actually supports.
- */
 export async function handleCodeWithHarness(
   deps: ToolDeps,
   harness: string,
   input: z.infer<z.ZodObject<typeof routeInputShape>>,
   maxFallbacks: number,
+  extra?: ToolExtra,
 ): Promise<RouteResponse> {
   const hints = mergeHintsForHarness(input.hints, harness);
-  return runRouted(
-    deps,
-    input.prompt,
-    input.files ?? [],
-    input.workingDir ?? process.cwd(),
-    hints,
-    maxFallbacks,
-  );
+  const progressToken = extra?._meta?.progressToken;
+  const toolName = `code_with_${harness}`;
+  return withMcpToolSpan({ "tool.name": toolName }, async () => {
+    if (progressToken !== undefined) {
+      return runRoutedStreaming(
+        deps,
+        input.prompt,
+        input.files ?? [],
+        input.workingDir ?? process.cwd(),
+        hints,
+        maxFallbacks,
+        extra,
+      );
+    }
+    return runRoutedBuffered(
+      deps,
+      input.prompt,
+      input.files ?? [],
+      input.workingDir ?? process.cwd(),
+      hints,
+      maxFallbacks,
+    );
+  });
 }
 
 export async function handleCodeAuto(
   deps: ToolDeps,
   input: z.infer<z.ZodObject<typeof autoInputShape>>,
+  extra?: ToolExtra,
 ): Promise<RouteResponse> {
-  return runRouted(
-    deps,
-    input.prompt,
-    input.files ?? [],
-    input.workingDir ?? process.cwd(),
-    toHints(input.hints),
-    2,
-  );
+  const progressToken = extra?._meta?.progressToken;
+  return withMcpToolSpan({ "tool.name": "code_auto" }, async () => {
+    if (progressToken !== undefined) {
+      return runRoutedStreaming(
+        deps,
+        input.prompt,
+        input.files ?? [],
+        input.workingDir ?? process.cwd(),
+        toHints(input.hints),
+        2,
+        extra,
+      );
+    }
+    return runRoutedBuffered(
+      deps,
+      input.prompt,
+      input.files ?? [],
+      input.workingDir ?? process.cwd(),
+      toHints(input.hints),
+      2,
+    );
+  });
 }
 
 export async function handleCodeMixture(
   deps: ToolDeps,
   input: z.infer<z.ZodObject<typeof mixtureInputShape>>,
+  extra?: ToolExtra,
 ): Promise<{ results: MixtureItem[] }> {
-  await ensureFreshConfig(deps.reloader);
-  const state = deps.holder.state;
-  const hints = toHints(input.hints);
-  const taskType: TaskType = hints.taskType ?? "plan";
-  const requested = new Set(input.services ?? []);
+  return withMcpToolSpan({ "tool.name": "code_mixture" }, async () => {
+    await ensureFreshConfig(deps.reloader);
+    const state = deps.holder.state;
+    const hints = toHints(input.hints);
+    const taskType: TaskType = hints.taskType ?? "plan";
+    const requested = new Set(input.services ?? []);
+    const progressToken = extra?._meta?.progressToken;
+    const counter = { value: 0 };
 
-  // Collect candidate services — enabled, reachable, not tripped.
-  const candidates: string[] = [];
-  for (const [name, svc] of Object.entries(state.config.services)) {
-    if (!svc.enabled) continue;
-    if (!(name in state.dispatchers)) continue;
-    if (requested.size > 0 && !requested.has(name)) continue;
-    const breaker = state.router.getBreaker(name);
-    if (breaker && breaker.isTripped) continue;
-    const disp = state.dispatchers[name];
-    if (!disp?.isAvailable()) continue;
-    candidates.push(name);
-  }
+    const candidates: string[] = [];
+    for (const [name, svc] of Object.entries(state.config.services)) {
+      if (!svc.enabled) continue;
+      if (!(name in state.dispatchers)) continue;
+      if (requested.size > 0 && !requested.has(name)) continue;
+      const breaker = state.router.getBreaker(name);
+      if (breaker && breaker.isTripped) continue;
+      const disp = state.dispatchers[name];
+      if (!disp?.isAvailable()) continue;
+      candidates.push(name);
+    }
 
-  if (candidates.length === 0) {
-    return { results: [] };
-  }
+    if (candidates.length === 0) return { results: [] };
 
-  const prompt = input.prompt;
-  const files = input.files ?? [];
-  const workingDir = input.workingDir ?? process.cwd();
+    const prompt = input.prompt;
+    const files = input.files ?? [];
+    const workingDir = input.workingDir ?? process.cwd();
 
-  // Fan out in parallel via Router.routeTo — that path handles circuit-breaker
-  // updates and quota recording for us.
-  const outcomes = await Promise.all(
-    candidates.map(async (svcName): Promise<MixtureItem> => {
-      const svc = state.config.services[svcName]!;
-      const cap = svc.capabilities[taskType as "execute" | "plan" | "review"] ?? 1.0;
-      const { qualityScore, elo } = await state.leaderboard.getQualityScore(
-        svc.leaderboardModel,
-        svc.thinkingLevel,
-      );
-      const t0 = Date.now();
-      const { result } = await state.router.routeTo(svcName, prompt, files, workingDir);
-      const duration = Date.now() - t0;
-      const item: MixtureItem = {
-        service: svcName,
-        success: result.success,
-        output: result.output,
-        durationMs: duration,
-        capabilityScore: cap,
-        qualityScore,
-      };
-      if (result.error !== undefined) item.error = result.error;
-      if (elo !== null) item.elo = elo;
-      return item;
-    }),
-  );
+    // When streaming is requested, fan out via router.streamTo and multiplex
+    // events through the single progress token. When not streaming, use the
+    // buffered routeTo (same as before).
+    const outcomes = await Promise.all(
+      candidates.map(async (svcName): Promise<MixtureItem> => {
+        const svc = state.config.services[svcName]!;
+        const cap = svc.capabilities[taskType as "execute" | "plan" | "review"] ?? 1.0;
+        const { qualityScore, elo } = await state.leaderboard.getQualityScore(
+          svc.leaderboardModel,
+          svc.thinkingLevel,
+        );
+        const t0 = Date.now();
+        let result: DispatchResult;
+        if (progressToken !== undefined) {
+          let capturedResult: DispatchResult | null = null;
+          for await (const { event } of state.router.streamTo(
+            svcName,
+            prompt,
+            files,
+            workingDir,
+          )) {
+            await emitProgress(extra, progressToken, counter, event, svcName);
+            if (event.type === "completion") capturedResult = event.result;
+          }
+          result = capturedResult ?? {
+            output: "",
+            service: svcName,
+            success: false,
+            error: "Stream ended without completion",
+          };
+        } else {
+          const outcome = await state.router.routeTo(svcName, prompt, files, workingDir);
+          result = outcome.result;
+        }
+        const duration = Date.now() - t0;
+        const item: MixtureItem = {
+          service: svcName,
+          success: result.success,
+          output: result.output,
+          durationMs: duration,
+          capabilityScore: cap,
+          qualityScore,
+        };
+        if (result.error !== undefined) item.error = result.error;
+        if (elo !== null) item.elo = elo;
+        return item;
+      }),
+    );
 
-  // Sort: successes first (by capability DESC), then failures.
-  outcomes.sort((a, b) => {
-    if (a.success !== b.success) return a.success ? -1 : 1;
-    return b.capabilityScore - a.capabilityScore;
+    outcomes.sort((a, b) => {
+      if (a.success !== b.success) return a.success ? -1 : 1;
+      return b.capabilityScore - a.capabilityScore;
+    });
+    return { results: outcomes };
   });
-  return { results: outcomes };
 }
 
 export async function handleQuotaStatus(
@@ -417,7 +602,6 @@ export async function handleDashboard(deps: ToolDeps): Promise<string> {
   }
   lines.push("");
 
-  // Group by tier for display
   const byTier: Map<number, string[]> = new Map();
   for (const name of Object.keys(state.config.services)) {
     const svc = state.config.services[name]!;
@@ -450,7 +634,6 @@ export async function handleDashboard(deps: ToolDeps): Promise<string> {
         lines.push(`      connection : ${label}`);
       }
 
-      // Quality + capability summary
       const { qualityScore, elo } = await state.leaderboard.getQualityScore(
         svc.leaderboardModel,
         svc.thinkingLevel,
@@ -561,7 +744,6 @@ export async function handleSetup(
   const claudeDir = path.join(home, ".claude");
   await fs.mkdir(claudeDir, { recursive: true });
 
-  // 1. CLAUDE.md
   if (writeMd) {
     const claudeMdPath = path.join(claudeDir, "CLAUDE.md");
     let existing = "";
@@ -581,7 +763,6 @@ export async function handleSetup(
     results.push("· CLAUDE.md  — skipped (writeClaudeMd=false)");
   }
 
-  // 2. hooks.json SessionStart entry
   if (writeHook) {
     const hooksPath = path.join(claudeDir, "hooks.json");
     let hooks: Record<string, unknown> = {};
@@ -607,7 +788,6 @@ export async function handleSetup(
         matcher: "",
         hooks: [
           {
-            // Marker inside the command lets us idempotently detect re-runs.
             type: "command",
             command: `node -e "/* ${marker} */ console.log('coding-agent-mcp: use code_auto for coding tasks')"`,
           },
@@ -630,7 +810,6 @@ export async function handleSetup(
 // Registration with McpServer
 // ---------------------------------------------------------------------------
 
-/** The canonical list of tool names — also exported so server.test.ts can assert. */
 export const TOOL_NAMES = [
   "code_with_claude",
   "code_with_cursor",
@@ -654,7 +833,8 @@ export function registerTools(server: McpServer, deps: ToolDeps): void {
         "Picks Opus for plan/review, Sonnet for execute.",
       inputSchema: routeInputShape,
     },
-    async (args) => jsonText(await handleCodeWithHarness(deps, "claude_code", args, 1)),
+    async (args, extra) =>
+      jsonText(await handleCodeWithHarness(deps, "claude_code", args, 1, extra as ToolExtra)),
   );
 
   server.registerTool(
@@ -666,7 +846,8 @@ export function registerTools(server: McpServer, deps: ToolDeps): void {
         "Editor-aware with codebase indexing.",
       inputSchema: routeInputShape,
     },
-    async (args) => jsonText(await handleCodeWithHarness(deps, "cursor", args, 2)),
+    async (args, extra) =>
+      jsonText(await handleCodeWithHarness(deps, "cursor", args, 2, extra as ToolExtra)),
   );
 
   server.registerTool(
@@ -678,7 +859,8 @@ export function registerTools(server: McpServer, deps: ToolDeps): void {
         "Full-auto execution, best for execute task type.",
       inputSchema: routeInputShape,
     },
-    async (args) => jsonText(await handleCodeWithHarness(deps, "codex", args, 1)),
+    async (args, extra) =>
+      jsonText(await handleCodeWithHarness(deps, "codex", args, 1, extra as ToolExtra)),
   );
 
   server.registerTool(
@@ -690,7 +872,8 @@ export function registerTools(server: McpServer, deps: ToolDeps): void {
         "1M+ token context, strong for plan/review.",
       inputSchema: routeInputShape,
     },
-    async (args) => jsonText(await handleCodeWithHarness(deps, "gemini_cli", args, 1)),
+    async (args, extra) =>
+      jsonText(await handleCodeWithHarness(deps, "gemini_cli", args, 1, extra as ToolExtra)),
   );
 
   server.registerTool(
@@ -702,7 +885,7 @@ export function registerTools(server: McpServer, deps: ToolDeps): void {
         "quality, CLI capability, and per-task-type capability profiles.",
       inputSchema: autoInputShape,
     },
-    async (args) => jsonText(await handleCodeAuto(deps, args)),
+    async (args, extra) => jsonText(await handleCodeAuto(deps, args, extra as ToolExtra)),
   );
 
   server.registerTool(
@@ -714,7 +897,7 @@ export function registerTools(server: McpServer, deps: ToolDeps): void {
         "per-service result array for the caller to synthesize.",
       inputSchema: mixtureInputShape,
     },
-    async (args) => jsonText(await handleCodeMixture(deps, args)),
+    async (args, extra) => jsonText(await handleCodeMixture(deps, args, extra as ToolExtra)),
   );
 
   server.registerTool(

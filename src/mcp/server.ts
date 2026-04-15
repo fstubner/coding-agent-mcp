@@ -19,6 +19,7 @@ import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 
 import { bootstrapRuntime, ConfigHotReloader, RuntimeHolder } from "./config-hot-reload.js";
 import { registerTools } from "./tools.js";
+import { initObservability } from "../observability/index.js";
 
 // Read the package version lazily so this module stays dependency-free.
 const SERVER_NAME = "coding-agent-mcp";
@@ -46,6 +47,9 @@ export interface BuiltMcp {
 
 /** Bootstrap runtime state + build an `McpServer` with all tools registered. */
 export async function buildMcpServer(opts: BuildMcpOptions = {}): Promise<BuiltMcp> {
+  // Initialize OpenTelemetry once. Idempotent; no-op when OTEL_SDK_DISABLED=true.
+  await initObservability();
+
   const stateOpts: { configPath?: string } = {};
   if (opts.configPath !== undefined) stateOpts.configPath = opts.configPath;
   const state = await bootstrapRuntime(stateOpts);

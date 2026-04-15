@@ -8,12 +8,15 @@
  *
  * Quota: Reactive only. Codex uses token-based pricing (no hard monthly limit);
  * circuit breaker handles exhaustion from 429 responses.
+ *
+ * R3: emits JSONL events as they're parsed — `tool_use` and `thinking`
+ * events surface mid-run, `completion` fires once the child exits.
  */
 
 import which from "which";
-import type { DispatchResult, QuotaInfo } from "../types.js";
-import type { Dispatcher, DispatchOpts } from "./base.js";
-import { runSubprocess } from "./shared/subprocess.js";
+import type { DispatchResult, DispatcherEvent, QuotaInfo } from "../types.js";
+import { BaseDispatcher, type DispatchOpts } from "./base.js";
+import { streamSubprocess } from "./shared/stream-subprocess.js";
 import { resolveCliCommand } from "./shared/windows-cmd.js";
 
 const DEFAULT_TIMEOUT_MS = 600_000; // 10 minutes
@@ -23,6 +26,8 @@ interface CodexJsonEvent {
   item?: {
     type?: string;
     text?: string;
+    name?: string;
+    input?: unknown;
   };
   message?: {
     content?: string;
@@ -35,7 +40,7 @@ interface CodexJsonEvent {
   };
 }
 
-export class CodexDispatcher implements Dispatcher {
+export class CodexDispatcher extends BaseDispatcher {
   readonly id = "codex";
 
   isAvailable(): boolean {
@@ -43,29 +48,39 @@ export class CodexDispatcher implements Dispatcher {
   }
 
   async checkQuota(): Promise<QuotaInfo> {
-    // Token-based pricing — no hard quota to proactively check. Deferred to R3.
     return { service: "codex", source: "unknown" };
   }
 
-  async dispatch(
+  stream(
     prompt: string,
     files: string[],
     workingDir: string,
     opts: DispatchOpts = {},
-  ): Promise<DispatchResult> {
+  ): AsyncIterable<DispatcherEvent> {
+    return this.#runStream(prompt, files, workingDir, opts);
+  }
+
+  async *#runStream(
+    prompt: string,
+    files: string[],
+    workingDir: string,
+    opts: DispatchOpts,
+  ): AsyncGenerator<DispatcherEvent> {
     const foundPath = await which("codex", { nothrow: true });
     if (!foundPath) {
-      return {
-        output: "",
-        service: "codex",
-        success: false,
-        error: "codex CLI not found",
+      yield {
+        type: "completion",
+        result: {
+          output: "",
+          service: "codex",
+          success: false,
+          error: "codex CLI not found",
+        },
       };
+      return;
     }
     const resolved = await resolveCliCommand("codex");
 
-    // Codex takes a positional prompt argument; inline file paths so the
-    // agent is aware of them (Codex can read them via its own tools).
     let fullPrompt = prompt;
     if (files.length > 0) {
       const fileList = files.map((p) => `  ${p}`).join("\n");
@@ -79,17 +94,13 @@ export class CodexDispatcher implements Dispatcher {
       "--full-auto",
       "--json",
     ];
-
     if (opts.modelOverride) {
       args.push("--model", opts.modelOverride);
     }
-
     if (workingDir) {
-      // Codex takes a flag (not process cwd) to set its working directory.
       args.push("--cd", workingDir);
     }
 
-    // Forward OPENAI_API_KEY if the caller set it in process.env.
     const extraEnv: Record<string, string> = {};
     const apiKey = process.env["OPENAI_API_KEY"];
     if (apiKey) {
@@ -97,123 +108,150 @@ export class CodexDispatcher implements Dispatcher {
     }
 
     const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
-
-    const subOpts: Parameters<typeof runSubprocess>[2] = { timeoutMs };
+    const subOpts: Parameters<typeof streamSubprocess>[2] = { timeoutMs };
     if (workingDir) subOpts.cwd = workingDir;
     if (Object.keys(extraEnv).length > 0) subOpts.env = extraEnv;
-    const sub = await runSubprocess(resolved.command, args, subOpts);
 
-    if (sub.timedOut) {
-      return {
-        output: sub.stdout,
-        service: "codex",
-        success: false,
-        error: `Timed out after ${timeoutMs}ms`,
-        durationMs: sub.durationMs,
-      };
+    const stdoutBuf: string[] = [];
+    const stderrBuf: string[] = [];
+    let exitCode = -1;
+    let durationMs = 0;
+    let timedOut = false;
+
+    // Incremental JSONL parser — splits on newlines as chunks arrive so we
+    // can emit tool_use / thinking events mid-run rather than waiting for
+    // the child to exit. Aggregates usage + last agent_message for the
+    // final completion event.
+    let lineBuffer = "";
+    let lastText = "";
+    let inputTokens = 0;
+    let outputTokens = 0;
+    let sawUsage = false;
+    let sawAnyJson = false;
+
+    const emitLine = (line: string): DispatcherEvent[] => {
+      const out: DispatcherEvent[] = [];
+      const trimmed = line.trim();
+      if (!trimmed) return out;
+      let event: CodexJsonEvent;
+      try {
+        event = JSON.parse(trimmed) as CodexJsonEvent;
+      } catch {
+        return out;
+      }
+      sawAnyJson = true;
+
+      if (
+        event.type === "item.completed" &&
+        event.item &&
+        event.item.type === "agent_message"
+      ) {
+        const t = event.item.text;
+        if (typeof t === "string" && t.length > 0) {
+          lastText = t;
+        }
+      }
+      if (event.type === "message" && event.message?.content) {
+        lastText = event.message.content;
+      }
+
+      if (
+        event.item &&
+        event.item.type === "tool_use" &&
+        typeof event.item.name === "string"
+      ) {
+        out.push({
+          type: "tool_use",
+          name: event.item.name,
+          input: event.item.input,
+        });
+      } else if (event.type === "thinking" && event.item?.text) {
+        out.push({ type: "thinking", chunk: event.item.text });
+      }
+
+      if (event.usage) {
+        const inTok = event.usage.input_tokens ?? event.usage.prompt_tokens ?? 0;
+        const outTok = event.usage.output_tokens ?? event.usage.completion_tokens ?? 0;
+        if (inTok || outTok) {
+          inputTokens += inTok;
+          outputTokens += outTok;
+          sawUsage = true;
+        }
+      }
+      return out;
+    };
+
+    for await (const evt of streamSubprocess(resolved.command, args, subOpts)) {
+      if ("stream" in evt) {
+        if (evt.stream === "stdout") {
+          stdoutBuf.push(evt.chunk);
+          yield { type: "stdout", chunk: evt.chunk };
+          lineBuffer += evt.chunk;
+          let newlineIdx = lineBuffer.indexOf("\n");
+          while (newlineIdx >= 0) {
+            const line = lineBuffer.slice(0, newlineIdx);
+            lineBuffer = lineBuffer.slice(newlineIdx + 1);
+            for (const out of emitLine(line)) yield out;
+            newlineIdx = lineBuffer.indexOf("\n");
+          }
+        } else {
+          stderrBuf.push(evt.chunk);
+          yield { type: "stderr", chunk: evt.chunk };
+        }
+      } else {
+        exitCode = evt.exitCode;
+        durationMs = evt.durationMs;
+        timedOut = evt.timedOut;
+      }
     }
 
-    // Try stdout first; on Windows via `cmd /c` output can land on stderr.
-    const parsed =
-      parseCodexJsonLines(sub.stdout) ?? parseCodexJsonLines(sub.stderr);
+    // Flush any trailing partial line.
+    if (lineBuffer.length > 0) {
+      for (const out of emitLine(lineBuffer)) yield out;
+      lineBuffer = "";
+    }
 
-    const parsedText = parsed?.text ?? "";
-    const output = parsedText || sub.stdout.trim() || sub.stderr.trim();
+    const stdout = stdoutBuf.join("");
+    const stderr = stderrBuf.join("");
+
+    if (timedOut) {
+      yield {
+        type: "completion",
+        result: {
+          output: stdout,
+          service: "codex",
+          success: false,
+          error: `Timed out after ${timeoutMs}ms`,
+          durationMs,
+        },
+      };
+      return;
+    }
+
+    // Stderr path (Windows cmd /c can shuffle streams). If nothing parsed
+    // from stdout, try stderr now.
+    if (!sawAnyJson && stderr) {
+      for (const line of stderr.split(/\r?\n/)) {
+        for (const out of emitLine(line)) yield out;
+      }
+    }
+
+    const parsedText = sawAnyJson ? lastText.trim() : "";
+    const output = parsedText || stdout.trim() || stderr.trim();
 
     const result: DispatchResult = {
       output,
       service: "codex",
-      success: sub.exitCode === 0,
-      durationMs: sub.durationMs,
+      success: exitCode === 0,
+      durationMs,
     };
-
-    if (parsed?.tokensUsed) {
-      result.tokensUsed = parsed.tokensUsed;
+    if (sawUsage) {
+      result.tokensUsed = { input: inputTokens, output: outputTokens };
+    }
+    if (exitCode !== 0) {
+      result.error = stderr.trim() || `Exit code ${exitCode}`;
     }
 
-    if (sub.exitCode !== 0) {
-      result.error = sub.stderr.trim() || `Exit code ${sub.exitCode}`;
-    }
-
-    return result;
+    yield { type: "completion", result };
   }
-}
-
-interface ParsedCodexOutput {
-  text: string;
-  tokensUsed?: { input: number; output: number };
-}
-
-/**
- * Parse codex exec --json output (newline-delimited JSON events).
- *
- * Confirmed event shape (codex-rs/exec/src/exec_events.rs, ThreadEvent):
- *   {"type": "item.completed",
- *    "item": {"id": "...", "type": "agent_message", "text": "..."}}
- *
- * Also handles a generic "message" event shape as a fallback for newer CLI
- * versions. Usage fields are summed across all events that carry them.
- *
- * Returns null if no JSON lines parsed at all (so caller can fall back to
- * raw stdout). Returns a ParsedCodexOutput with empty text if lines parsed
- * but no message-bearing event was found.
- */
-function parseCodexJsonLines(raw: string): ParsedCodexOutput | null {
-  const lines = raw.split(/\r?\n/);
-  let lastText = "";
-  let inputTokens = 0;
-  let outputTokens = 0;
-  let sawUsage = false;
-  let sawAnyJson = false;
-
-  for (const rawLine of lines) {
-    const line = rawLine.trim();
-    if (!line) continue;
-    let event: CodexJsonEvent;
-    try {
-      event = JSON.parse(line) as CodexJsonEvent;
-    } catch {
-      continue;
-    }
-    sawAnyJson = true;
-
-    // Preferred: item.completed with agent_message item.
-    if (
-      event.type === "item.completed" &&
-      event.item &&
-      event.item.type === "agent_message"
-    ) {
-      const t = event.item.text;
-      if (typeof t === "string" && t.length > 0) {
-        lastText = t;
-      }
-    }
-
-    // Fallback: a generic message event with a content string.
-    if (event.type === "message" && event.message?.content) {
-      lastText = event.message.content;
-    }
-
-    if (event.usage) {
-      const inTok =
-        event.usage.input_tokens ?? event.usage.prompt_tokens ?? 0;
-      const outTok =
-        event.usage.output_tokens ?? event.usage.completion_tokens ?? 0;
-      if (inTok || outTok) {
-        inputTokens += inTok;
-        outputTokens += outTok;
-        sawUsage = true;
-      }
-    }
-  }
-
-  if (!sawAnyJson) {
-    return null;
-  }
-
-  const parsed: ParsedCodexOutput = { text: lastText.trim() };
-  if (sawUsage) {
-    parsed.tokensUsed = { input: inputTokens, output: outputTokens };
-  }
-  return parsed;
 }

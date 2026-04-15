@@ -16,7 +16,10 @@
  * (used by tests).
  *
  * Auth:  GEMINI_API_KEY forwarded from process.env when present.
- * Quota: reactive only in R1; deferred proactive check to R3.
+ * Quota: reactive only; deferred proactive check to a later revision.
+ *
+ * R3: stream()-first. The CLI emits one JSON blob at end-of-run so chunks
+ * are forwarded verbatim; completion event parses the full buffer.
  */
 
 import fs from "node:fs/promises";
@@ -25,12 +28,13 @@ import path from "node:path";
 import which from "which";
 import type {
   DispatchResult,
+  DispatcherEvent,
   QuotaInfo,
   ServiceConfig,
   ThinkingLevel,
 } from "../types.js";
-import type { Dispatcher, DispatchOpts } from "./base.js";
-import { runSubprocess } from "./shared/subprocess.js";
+import { BaseDispatcher, type DispatchOpts } from "./base.js";
+import { streamSubprocess } from "./shared/stream-subprocess.js";
 import { resolveCliCommand } from "./shared/windows-cmd.js";
 
 const DEFAULT_TIMEOUT_MS = 600_000; // 10 minutes
@@ -74,10 +78,6 @@ function withLock<T>(fn: () => Promise<T>): Promise<T> {
   });
 }
 
-/**
- * Test-only accessor: waits for the lock chain to drain. Exported so tests
- * can assert serialization without relying on timing.
- */
 export function _geminiLockIdle(): Promise<void> {
   return lockChain;
 }
@@ -88,14 +88,6 @@ function settingsPath(): string {
   return path.join(os.homedir(), ".gemini", "settings.json");
 }
 
-/**
- * Patch ~/.gemini/settings.json with the requested thinking level, invoke
- * `fn`, then restore the original contents. If `level` is null/undefined,
- * `fn` is called without touching the settings file.
- *
- * The module-level lock is acquired for the entire patch → fn → restore
- * cycle so concurrent callers don't interleave.
- */
 async function withThinkingOverride<T>(
   level: ThinkingLevel | undefined,
   fn: () => Promise<T>,
@@ -123,14 +115,9 @@ async function withThinkingOverride<T>(
       }
     } catch (err) {
       const e = err as NodeJS.ErrnoException;
-      if (e?.code !== "ENOENT") {
-        // Unexpected read error; bubble up so the caller knows.
-        throw err;
-      }
-      // File simply doesn't exist yet.
+      if (e?.code !== "ENOENT") throw err;
     }
 
-    // Inject thinking level → modelConfigs.generateContentConfig.thinkingLevel
     const modelConfigs = getOrCreateObject(settings, "modelConfigs");
     const generateContentConfig = getOrCreateObject(
       modelConfigs,
@@ -144,14 +131,12 @@ async function withThinkingOverride<T>(
       return await fn();
     } finally {
       if (originalText !== null) {
-        // Restore verbatim to preserve whitespace and any fields we didn't touch.
         try {
           await fs.writeFile(file, originalText, "utf8");
         } catch {
-          // Best-effort restore; swallow to avoid masking the dispatch result.
+          // best-effort restore
         }
       } else {
-        // We created the file; remove just our addition.
         try {
           const raw = await fs.readFile(file, "utf8");
           const restored = JSON.parse(raw) as Record<string, unknown>;
@@ -188,12 +173,13 @@ function getOrCreateObject(
 // Dispatcher
 // ---------------------------------------------------------------------------
 
-export class GeminiDispatcher implements Dispatcher {
+export class GeminiDispatcher extends BaseDispatcher {
   readonly id = "gemini_cli";
   private readonly thinkingLevel: ThinkingLevel | undefined;
   private readonly configuredModel: string | undefined;
 
   constructor(svc?: ServiceConfig) {
+    super();
     this.thinkingLevel = svc?.thinkingLevel;
     this.configuredModel = svc?.model;
   }
@@ -203,26 +189,36 @@ export class GeminiDispatcher implements Dispatcher {
   }
 
   async checkQuota(): Promise<QuotaInfo> {
-    // Proactive quota check deferred to R3. The Python version runs a minimal
-    // prompt to scrape the stats field — that burns tokens and takes time, so
-    // we skip it until needed.
     return { service: "gemini_cli", source: "unknown" };
   }
 
-  async dispatch(
+  stream(
     prompt: string,
     files: string[],
     workingDir: string,
     opts: DispatchOpts = {},
-  ): Promise<DispatchResult> {
+  ): AsyncIterable<DispatcherEvent> {
+    return this.#runStream(prompt, files, workingDir, opts);
+  }
+
+  async *#runStream(
+    prompt: string,
+    files: string[],
+    workingDir: string,
+    opts: DispatchOpts,
+  ): AsyncGenerator<DispatcherEvent> {
     const foundPath = await which("gemini", { nothrow: true });
     if (!foundPath) {
-      return {
-        output: "",
-        service: "gemini_cli",
-        success: false,
-        error: "gemini CLI not found",
+      yield {
+        type: "completion",
+        result: {
+          output: "",
+          service: "gemini_cli",
+          success: false,
+          error: "gemini CLI not found",
+        },
       };
+      return;
     }
     const resolved = await resolveCliCommand("gemini");
 
@@ -237,7 +233,6 @@ export class GeminiDispatcher implements Dispatcher {
       args.push("--file", file);
     }
 
-    // Forward GEMINI_API_KEY if set.
     const extraEnv: Record<string, string> = {};
     const apiKey = process.env["GEMINI_API_KEY"];
     if (apiKey) {
@@ -246,65 +241,91 @@ export class GeminiDispatcher implements Dispatcher {
 
     const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
 
-    const subOpts: Parameters<typeof runSubprocess>[2] = { timeoutMs };
+    const subOpts: Parameters<typeof streamSubprocess>[2] = { timeoutMs };
     if (workingDir) subOpts.cwd = workingDir;
     if (Object.keys(extraEnv).length > 0) subOpts.env = extraEnv;
 
-    // Acquire the settings lock *around* the subprocess invocation so
-    // concurrent dispatches cannot race on ~/.gemini/settings.json.
-    const sub = await withThinkingOverride(this.thinkingLevel, () =>
-      runSubprocess(resolved.command, args, subOpts),
-    );
+    // withThinkingOverride wraps the subprocess invocation — we need to
+    // collect the stream events during the lock-held region. Buffer them
+    // here, then replay.
+    const events: DispatcherEvent[] = [];
+    const stdoutBuf: string[] = [];
+    const stderrBuf: string[] = [];
+    let exitCode = -1;
+    let durationMs = 0;
+    let timedOut = false;
 
-    if (sub.timedOut) {
-      return {
-        output: sub.stdout,
-        service: "gemini_cli",
-        success: false,
-        error: `Timed out after ${timeoutMs}ms`,
-        durationMs: sub.durationMs,
+    await withThinkingOverride(this.thinkingLevel, async () => {
+      for await (const evt of streamSubprocess(resolved.command, args, subOpts)) {
+        if ("stream" in evt) {
+          if (evt.stream === "stdout") {
+            stdoutBuf.push(evt.chunk);
+            events.push({ type: "stdout", chunk: evt.chunk });
+          } else {
+            stderrBuf.push(evt.chunk);
+            events.push({ type: "stderr", chunk: evt.chunk });
+          }
+        } else {
+          exitCode = evt.exitCode;
+          durationMs = evt.durationMs;
+          timedOut = evt.timedOut;
+        }
+      }
+    });
+
+    for (const e of events) yield e;
+
+    const stdout = stdoutBuf.join("");
+    const stderr = stderrBuf.join("");
+
+    if (timedOut) {
+      yield {
+        type: "completion",
+        result: {
+          output: stdout,
+          service: "gemini_cli",
+          success: false,
+          error: `Timed out after ${timeoutMs}ms`,
+          durationMs,
+        },
       };
+      return;
     }
 
-    const parsed = parseGeminiJson(sub.stdout) ?? parseGeminiJson(sub.stderr);
+    const parsed = parseGeminiJson(stdout) ?? parseGeminiJson(stderr);
     const parsedText = parsed?.text ?? "";
 
-    if (sub.exitCode === 0) {
-      const output =
-        parsedText || sub.stdout.trim() || sub.stderr.trim();
+    if (exitCode === 0) {
+      const output = parsedText || stdout.trim() || stderr.trim();
       const result: DispatchResult = {
         output,
         service: "gemini_cli",
         success: true,
-        durationMs: sub.durationMs,
+        durationMs,
       };
-      if (parsed?.tokensUsed) {
-        result.tokensUsed = parsed.tokensUsed;
-      }
-      return result;
+      if (parsed?.tokensUsed) result.tokensUsed = parsed.tokensUsed;
+      yield { type: "completion", result };
+      return;
     }
 
-    // Non-zero exit — detect rate limit.
-    const combined = `${sub.stdout}\n${sub.stderr}`;
+    const combined = `${stdout}\n${stderr}`;
     const { rateLimited, retryAfter } = detectRateLimit(combined);
     const errorDetail =
-      sub.stderr.trim() || sub.stdout.trim() || `Exit code ${sub.exitCode}`;
+      stderr.trim() || stdout.trim() || `Exit code ${exitCode}`;
 
     const result: DispatchResult = {
-      output: parsedText || sub.stdout.trim(),
+      output: parsedText || stdout.trim(),
       service: "gemini_cli",
       success: false,
       error: errorDetail,
-      durationMs: sub.durationMs,
+      durationMs,
     };
     if (rateLimited) {
       result.rateLimited = true;
       if (retryAfter !== null) result.retryAfter = retryAfter;
     }
-    if (parsed?.tokensUsed) {
-      result.tokensUsed = parsed.tokensUsed;
-    }
-    return result;
+    if (parsed?.tokensUsed) result.tokensUsed = parsed.tokensUsed;
+    yield { type: "completion", result };
   }
 }
 
@@ -327,8 +348,7 @@ function parseGeminiJson(raw: string): ParsedGeminiOutput | null {
 
   const obj = data as GeminiJsonResponse;
   const textCandidate = obj.response ?? obj.text;
-  const text =
-    typeof textCandidate === "string" ? textCandidate.trim() : "";
+  const text = typeof textCandidate === "string" ? textCandidate.trim() : "";
 
   const parsed: ParsedGeminiOutput = { text };
 

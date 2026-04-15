@@ -14,13 +14,16 @@
  * requires ANTHROPIC_API_KEY. We use subscription auth (Claude Desktop OAuth),
  * so omitting --bare lets the CLI pick up the saved credentials normally.
  *
- * Quota: Reactive only. No proactive quota endpoint — deferred to R3.
+ * R3: streaming is the canonical entry point. The CLI emits a single JSON
+ * object at the end of the run, so stdout chunks are surfaced verbatim as
+ * `stdout` events, and the `completion` event (built from the fully-buffered
+ * stdout) is yielded once the child exits.
  */
 
 import which from "which";
-import type { DispatchResult, QuotaInfo } from "../types.js";
-import type { Dispatcher, DispatchOpts } from "./base.js";
-import { runSubprocess } from "./shared/subprocess.js";
+import type { DispatchResult, DispatcherEvent, QuotaInfo } from "../types.js";
+import { BaseDispatcher, type DispatchOpts } from "./base.js";
+import { streamSubprocess } from "./shared/stream-subprocess.js";
 import { resolveCliCommand } from "./shared/windows-cmd.js";
 
 const ALLOWED_TOOLS = "Bash,Read,Edit,Write";
@@ -36,7 +39,7 @@ interface ClaudeJsonResult {
   };
 }
 
-export class ClaudeCodeDispatcher implements Dispatcher {
+export class ClaudeCodeDispatcher extends BaseDispatcher {
   readonly id = "claude_code";
 
   isAvailable(): boolean {
@@ -51,26 +54,36 @@ export class ClaudeCodeDispatcher implements Dispatcher {
     return { service: "claude_code", source: "unknown" };
   }
 
-  async dispatch(
+  stream(
     prompt: string,
     files: string[],
     workingDir: string,
     opts: DispatchOpts = {},
-  ): Promise<DispatchResult> {
-    // Upfront PATH check — resolveCliCommand below returns a non-null fallback
-    // even when the CLI isn't installed, so we detect availability first.
+  ): AsyncIterable<DispatcherEvent> {
+    return this.#runStream(prompt, files, workingDir, opts);
+  }
+
+  async *#runStream(
+    prompt: string,
+    files: string[],
+    workingDir: string,
+    opts: DispatchOpts,
+  ): AsyncGenerator<DispatcherEvent> {
     const foundPath = await which("claude", { nothrow: true });
     if (!foundPath) {
-      return {
-        output: "",
-        service: "claude_code",
-        success: false,
-        error: "claude CLI not found",
+      yield {
+        type: "completion",
+        result: {
+          output: "",
+          service: "claude_code",
+          success: false,
+          error: "claude CLI not found",
+        },
       };
+      return;
     }
     const resolved = await resolveCliCommand("claude");
 
-    // Inline file paths in the prompt body — Claude's Read tool loads them.
     let fullPrompt = prompt;
     if (files.length > 0) {
       const fileList = files.map((p) => `  ${p}`).join("\n");
@@ -88,49 +101,68 @@ export class ClaudeCodeDispatcher implements Dispatcher {
       "--permission-mode",
       "acceptEdits",
     ];
-
     if (opts.modelOverride) {
       args.push("--model", opts.modelOverride);
     }
 
     const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+    const subOpts: Parameters<typeof streamSubprocess>[2] = { timeoutMs };
+    if (workingDir) subOpts.cwd = workingDir;
 
-    // Claude Code uses OAuth/keychain — no API key env var.
-    const sub = await runSubprocess(resolved.command, args, {
-      ...(workingDir ? { cwd: workingDir } : {}),
-      timeoutMs,
-    });
+    const stdoutBuf: string[] = [];
+    const stderrBuf: string[] = [];
+    let exitCode = -1;
+    let durationMs = 0;
+    let timedOut = false;
 
-    if (sub.timedOut) {
-      return {
-        output: sub.stdout,
-        service: "claude_code",
-        success: false,
-        error: `Timed out after ${timeoutMs}ms`,
-        durationMs: sub.durationMs,
-      };
+    for await (const evt of streamSubprocess(resolved.command, args, subOpts)) {
+      if ("stream" in evt) {
+        if (evt.stream === "stdout") {
+          stdoutBuf.push(evt.chunk);
+          yield { type: "stdout", chunk: evt.chunk };
+        } else {
+          stderrBuf.push(evt.chunk);
+          yield { type: "stderr", chunk: evt.chunk };
+        }
+      } else {
+        exitCode = evt.exitCode;
+        durationMs = evt.durationMs;
+        timedOut = evt.timedOut;
+      }
     }
 
-    const parsed = parseClaudeJson(sub.stdout);
-    const output =
-      parsed.text ?? (sub.stdout.trim() || sub.stderr.trim());
+    const stdout = stdoutBuf.join("");
+    const stderr = stderrBuf.join("");
+
+    if (timedOut) {
+      yield {
+        type: "completion",
+        result: {
+          output: stdout,
+          service: "claude_code",
+          success: false,
+          error: `Timed out after ${timeoutMs}ms`,
+          durationMs,
+        },
+      };
+      return;
+    }
+
+    const parsed = parseClaudeJson(stdout);
+    const output = parsed.text ?? (stdout.trim() || stderr.trim());
 
     const result: DispatchResult = {
       output,
       service: "claude_code",
-      success: sub.exitCode === 0,
-      durationMs: sub.durationMs,
+      success: exitCode === 0,
+      durationMs,
     };
-
-    if (parsed.tokensUsed) {
-      result.tokensUsed = parsed.tokensUsed;
+    if (parsed.tokensUsed) result.tokensUsed = parsed.tokensUsed;
+    if (exitCode !== 0) {
+      result.error = stderr.trim() || `Exit code ${exitCode}`;
     }
 
-    if (sub.exitCode !== 0) {
-      result.error = sub.stderr.trim() || `Exit code ${sub.exitCode}`;
-    }
-
-    return result;
+    yield { type: "completion", result };
   }
 }
 

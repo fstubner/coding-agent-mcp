@@ -14,13 +14,17 @@
  *
  * Auth: reads CURSOR_API_KEY from process.env and forwards it to the subprocess.
  * Quota: no proactive quota endpoint; reactive only via circuit breaker.
+ *
+ * R3: stream()-first. The CLI emits one JSON object at the end of the run,
+ * so stdout chunks are forwarded verbatim and `completion` fires once the
+ * full blob has been parsed.
  */
 
 import os from "node:os";
 import which from "which";
-import type { DispatchResult, QuotaInfo } from "../types.js";
-import type { Dispatcher, DispatchOpts } from "./base.js";
-import { runSubprocess } from "./shared/subprocess.js";
+import type { DispatchResult, DispatcherEvent, QuotaInfo } from "../types.js";
+import { BaseDispatcher, type DispatchOpts } from "./base.js";
+import { streamSubprocess } from "./shared/stream-subprocess.js";
 import { resolveCliCommand } from "./shared/windows-cmd.js";
 
 const DEFAULT_TIMEOUT_MS = 600_000; // 10 minutes
@@ -37,44 +41,53 @@ interface CursorJsonResult {
   };
 }
 
-export class CursorDispatcher implements Dispatcher {
+export class CursorDispatcher extends BaseDispatcher {
   readonly id = "cursor";
 
   isAvailable(): boolean {
-    // Synchronous check; runtime availability is re-verified at dispatch time.
     return true;
   }
 
   async checkQuota(): Promise<QuotaInfo> {
-    // No proactive quota API for the Cursor CLI — reactive only. Deferred to R3.
     return { service: "cursor", source: "unknown" };
   }
 
-  async dispatch(
+  stream(
     prompt: string,
     files: string[],
     workingDir: string,
     opts: DispatchOpts = {},
-  ): Promise<DispatchResult> {
+  ): AsyncIterable<DispatcherEvent> {
+    return this.#runStream(prompt, files, workingDir, opts);
+  }
+
+  async *#runStream(
+    prompt: string,
+    files: string[],
+    workingDir: string,
+    opts: DispatchOpts,
+  ): AsyncGenerator<DispatcherEvent> {
     const foundPath = await which("agent", { nothrow: true });
     if (!foundPath) {
-      return {
-        output: "",
-        service: "cursor",
-        success: false,
-        error: "agent CLI not found — install via cursor.com/install",
+      yield {
+        type: "completion",
+        result: {
+          output: "",
+          service: "cursor",
+          success: false,
+          error: "agent CLI not found — install via cursor.com/install",
+        },
       };
+      return;
     }
     const resolved = await resolveCliCommand("agent");
 
-    // Inline file paths so the Cursor agent is aware of them.
     let fullPrompt = prompt;
     if (files.length > 0) {
       const fileList = files.map((p) => `  - ${p}`).join("\n");
       fullPrompt = `${prompt}\n\nFocus on these files:\n${fileList}`;
     }
 
-    // If the caller didn't supply a workingDir, default to HOME (matches Python).
     const effectiveDir = workingDir || os.homedir();
 
     const args: string[] = [
@@ -87,12 +100,10 @@ export class CursorDispatcher implements Dispatcher {
       "json",
       fullPrompt,
     ];
-
     if (opts.modelOverride) {
       args.push("--model", opts.modelOverride);
     }
 
-    // Forward CURSOR_API_KEY if the caller set it in process.env.
     const extraEnv: Record<string, string> = {};
     const apiKey = process.env["CURSOR_API_KEY"];
     if (apiKey) {
@@ -100,63 +111,85 @@ export class CursorDispatcher implements Dispatcher {
     }
 
     const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
-
-    const subOpts: Parameters<typeof runSubprocess>[2] = {
+    const subOpts: Parameters<typeof streamSubprocess>[2] = {
       timeoutMs,
       cwd: effectiveDir,
     };
     if (Object.keys(extraEnv).length > 0) subOpts.env = extraEnv;
-    const sub = await runSubprocess(resolved.command, args, subOpts);
 
-    if (sub.timedOut) {
-      return {
-        output: sub.stdout,
-        service: "cursor",
-        success: false,
-        error: `Timed out after ${timeoutMs}ms`,
-        durationMs: sub.durationMs,
-      };
+    const stdoutBuf: string[] = [];
+    const stderrBuf: string[] = [];
+    let exitCode = -1;
+    let durationMs = 0;
+    let timedOut = false;
+
+    for await (const evt of streamSubprocess(resolved.command, args, subOpts)) {
+      if ("stream" in evt) {
+        if (evt.stream === "stdout") {
+          stdoutBuf.push(evt.chunk);
+          yield { type: "stdout", chunk: evt.chunk };
+        } else {
+          stderrBuf.push(evt.chunk);
+          yield { type: "stderr", chunk: evt.chunk };
+        }
+      } else {
+        exitCode = evt.exitCode;
+        durationMs = evt.durationMs;
+        timedOut = evt.timedOut;
+      }
     }
 
-    // Try stdout first; fall back to stderr (cmd /c can shuffle streams).
-    const parsed = parseCursorJson(sub.stdout) ?? parseCursorJson(sub.stderr);
+    const stdout = stdoutBuf.join("");
+    const stderr = stderrBuf.join("");
+
+    if (timedOut) {
+      yield {
+        type: "completion",
+        result: {
+          output: stdout,
+          service: "cursor",
+          success: false,
+          error: `Timed out after ${timeoutMs}ms`,
+          durationMs,
+        },
+      };
+      return;
+    }
+
+    const parsed = parseCursorJson(stdout) ?? parseCursorJson(stderr);
     const parsedText = parsed?.text ?? null;
 
-    if (sub.exitCode === 0 && parsedText) {
+    if (exitCode === 0 && parsedText) {
       const result: DispatchResult = {
         output: parsedText,
         service: "cursor",
         success: true,
-        durationMs: sub.durationMs,
+        durationMs,
       };
-      if (parsed?.tokensUsed) {
-        result.tokensUsed = parsed.tokensUsed;
-      }
-      return result;
+      if (parsed?.tokensUsed) result.tokensUsed = parsed.tokensUsed;
+      yield { type: "completion", result };
+      return;
     }
 
     // Error path — detect rate limit in combined output.
-    const combined = `${sub.stdout}\n${sub.stderr}`;
+    const combined = `${stdout}\n${stderr}`;
     const { rateLimited, retryAfter } = detectRateLimit(combined);
-
     const errorDetail =
-      sub.stderr.trim() || sub.stdout.trim() || `Exit code ${sub.exitCode}`;
+      stderr.trim() || stdout.trim() || `Exit code ${exitCode}`;
 
     const result: DispatchResult = {
       output: parsedText ?? errorDetail,
       service: "cursor",
       success: false,
       error: errorDetail,
-      durationMs: sub.durationMs,
+      durationMs,
     };
     if (rateLimited) {
       result.rateLimited = true;
       if (retryAfter !== null) result.retryAfter = retryAfter;
     }
-    if (parsed?.tokensUsed) {
-      result.tokensUsed = parsed.tokensUsed;
-    }
-    return result;
+    if (parsed?.tokensUsed) result.tokensUsed = parsed.tokensUsed;
+    yield { type: "completion", result };
   }
 }
 
@@ -165,21 +198,10 @@ interface ParsedCursorOutput {
   tokensUsed?: { input: number; output: number };
 }
 
-/**
- * Parse `agent --output-format json` output.
- *
- * The CLI emits a single JSON object with a top-level "result" field. Some
- * variants may place the text under "output" or "text" instead — we check all.
- *
- * Returns null only when `raw` is empty. If `raw` is non-empty but unparseable,
- * returns { text: null } so callers can distinguish "no output" from "bad output".
- */
 function parseCursorJson(raw: string): ParsedCursorOutput | null {
   const trimmed = raw.trim();
   if (!trimmed) return null;
 
-  // The JSON may occupy a single line or span multiple lines. Try line-by-line
-  // first (matches Python), then fall back to the whole blob.
   const lines = trimmed.split(/\r?\n/);
   for (const rawLine of lines) {
     const line = rawLine.trim();
@@ -219,11 +241,6 @@ function tryParseJsonObj(s: string): ParsedCursorOutput | null {
   return parsed;
 }
 
-/**
- * Scan combined stdout+stderr for rate-limit markers. Mirrors the Python
- * reference's _detect_rate_limit. Retry-after is an optional numeric value;
- * returns null when no explicit delay was found.
- */
 function detectRateLimit(text: string): {
   rateLimited: boolean;
   retryAfter: number | null;
