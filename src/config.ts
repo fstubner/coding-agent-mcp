@@ -32,8 +32,12 @@ interface CliDefaults {
   tier: number;
   thinkingLevel?: "low" | "medium" | "high";
   capabilities: { execute: number; plan: number; review: number };
+  maxOutputTokens?: number;
+  maxInputTokens?: number;
 }
 
+// Token limits as of April 2026. Treat as conservative upper bounds —
+// providers occasionally raise them, rarely lower them.
 const CLI_DEFAULTS: Record<string, CliDefaults> = {
   claude_code: {
     command: "claude",
@@ -42,6 +46,8 @@ const CLI_DEFAULTS: Record<string, CliDefaults> = {
     cliCapability: 1.1,
     tier: 1,
     capabilities: { execute: 0.95, plan: 1.0, review: 1.0 },
+    maxOutputTokens: 64_000,
+    maxInputTokens: 1_000_000, // Opus + Sonnet 1M context
   },
   codex: {
     command: "codex",
@@ -50,6 +56,8 @@ const CLI_DEFAULTS: Record<string, CliDefaults> = {
     cliCapability: 1.08,
     tier: 1,
     capabilities: { execute: 1.0, plan: 0.83, review: 0.82 },
+    maxOutputTokens: 128_000,
+    maxInputTokens: 400_000,
   },
   cursor: {
     command: "agent",
@@ -58,6 +66,8 @@ const CLI_DEFAULTS: Record<string, CliDefaults> = {
     cliCapability: 1.05,
     tier: 1,
     capabilities: { execute: 1.0, plan: 0.82, review: 0.9 },
+    maxOutputTokens: 64_000,
+    maxInputTokens: 1_000_000,
   },
   gemini_cli: {
     command: "gemini",
@@ -67,6 +77,8 @@ const CLI_DEFAULTS: Record<string, CliDefaults> = {
     tier: 1,
     thinkingLevel: "high",
     capabilities: { execute: 0.87, plan: 0.97, review: 0.95 },
+    maxOutputTokens: 65_536,
+    maxInputTokens: 2_000_000, // Gemini 3.1 Pro 2M context
   },
 };
 
@@ -207,6 +219,12 @@ function buildLegacyConfig(raw: Record<string, unknown>): RouterConfig {
         : {}),
       escalateOn: escalateOnFrom(svc.escalate_on),
       capabilities: capsFrom(svc.capabilities),
+      ...(typeof svc.max_output_tokens === "number"
+        ? { maxOutputTokens: svc.max_output_tokens }
+        : {}),
+      ...(typeof svc.max_input_tokens === "number"
+        ? { maxInputTokens: svc.max_input_tokens }
+        : {}),
     };
     services[name] = svcConfig;
   }
@@ -281,6 +299,16 @@ async function detectServices(
         : {}),
       escalateOn: escalateOnFrom(override.escalate_on),
       capabilities: caps,
+      ...(() => {
+        const m = override.max_output_tokens;
+        const v = typeof m === "number" ? m : defaults.maxOutputTokens;
+        return v !== undefined ? { maxOutputTokens: v } : {};
+      })(),
+      ...(() => {
+        const m = override.max_input_tokens;
+        const v = typeof m === "number" ? m : defaults.maxInputTokens;
+        return v !== undefined ? { maxInputTokens: v } : {};
+      })(),
     };
     services[name] = svc;
   }

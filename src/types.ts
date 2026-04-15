@@ -48,6 +48,21 @@ export interface ServiceConfig {
   escalateModel?: string;
   escalateOn: TaskType[];
   capabilities: Partial<Record<"execute" | "plan" | "review", number>>;
+  /**
+   * Maximum output tokens the model can produce in a single dispatch.
+   * Callers (Planners, Workers, Reconcilers) use this to size work so it fits
+   * without mid-call truncation. A value of `undefined` means "unknown /
+   * assume the provider default" — callers that need to chunk conservatively
+   * should treat absence as a low bound.
+   */
+  maxOutputTokens?: number;
+  /**
+   * Context window (input + output) in tokens. Used by the
+   * `preferLargeContext` route hint and by planners sizing up prompt payloads.
+   * Advertised by the provider; may be model-specific when `escalateModel` is
+   * in effect — consult the resolved model at dispatch time.
+   */
+  maxInputTokens?: number;
 }
 
 export interface RouterConfig {
